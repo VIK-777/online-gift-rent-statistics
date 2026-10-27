@@ -222,20 +222,29 @@ export class TonApiClient {
   }
 
   /**
-   * Fetches multiple NFT items in a single batch request via POST /v2/nfts/_bulk.
+   * Fetches multiple NFT items in batch requests via POST /v2/nfts/_bulk.
+   * Chunks in batches of 50 to avoid request size limits.
    */
   async getNftsBulk(nftAddresses: string[]): Promise<TonNftItem[]> {
     if (nftAddresses.length === 0) return []
-    try {
-      const res = await this.request<{ nft_items: TonNftItem[] }>('/nfts/_bulk', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ account_ids: nftAddresses })
-      })
-      return res?.nft_items || []
-    } catch {
-      return []
+    const chunkSize = 50
+    const results: TonNftItem[] = []
+    for (let i = 0; i < nftAddresses.length; i += chunkSize) {
+      const chunk = nftAddresses.slice(i, i + chunkSize)
+      try {
+        const res = await this.request<{ nft_items: TonNftItem[] }>('/nfts/_bulk', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ account_ids: chunk })
+        })
+        if (res?.nft_items) {
+          results.push(...res.nft_items)
+        }
+      } catch (err) {
+        console.warn('[TonApiClient] Error fetching bulk NFTs chunk:', err)
+      }
     }
+    return results
   }
 
   /**
