@@ -149,22 +149,34 @@ export class RentalScanner {
 
         // Check actions in event
         if (ev.actions) {
+          const isTonnelListing = ev.actions.some(act =>
+            act.type === 'SmartContractExec' &&
+            act.SmartContractExec?.operation === '0x0822d8ae'
+          )
+
+          const isMarketAppListing = ev.actions.some(act =>
+            (act.type === 'SmartContractExec' && act.SmartContractExec?.operation === '0x664c0905') ||
+            (act.type === 'NftItemTransfer' && act.NftItemTransfer?.comment?.toLowerCase().includes('0x01fc1dbc'))
+          )
+
           for (const act of ev.actions) {
-            // 1. Detect candidate NFTs transferred out of wallet or returned back
+            // 1. Detect candidate NFTs listed for rent on Tonnel or MarketApp (Kotlin parity)
             if (act.type === 'NftItemTransfer' && act.NftItemTransfer) {
               const nftTrans = act.NftItemTransfer
               const nftAddr = nftTrans.nft?.toLowerCase()
               const sender = nftTrans.sender?.address?.toLowerCase()
               const recipient = nftTrans.recipient?.address?.toLowerCase()
 
-              if (nftAddr && !nftLatestTransfer.has(nftAddr)) {
-                if (recipient === targetWallet) {
-                  nftLatestTransfer.set(nftAddr, { status: 'IN_WALLET' })
-                } else if (sender === targetWallet && recipient) {
-                  nftLatestTransfer.set(nftAddr, { status: 'RENTED_OUT', contract: recipient })
+              if (nftAddr && sender === targetWallet && (isTonnelListing || isMarketAppListing)) {
+                newCandidates.add(nftAddr)
+                if (recipient) {
                   contractToNftMap[recipient] = nftAddr
-                  newCandidates.add(nftAddr)
                 }
+              }
+
+              // Track returned NFTs
+              if (nftAddr && recipient === targetWallet && !nftLatestTransfer.has(nftAddr)) {
+                nftLatestTransfer.set(nftAddr, { status: 'IN_WALLET' })
               }
             }
 
@@ -231,7 +243,7 @@ export class RentalScanner {
         })
 
         try {
-          const acc = await this.client.getAccount(sender)
+          const acc = await this.client.getBlockchainAccount(sender)
           if (acc?.data) {
             const extracted = BocParser.extractMarketAppNftAddress(acc.data)
             if (extracted) {
@@ -444,7 +456,7 @@ export class RentalScanner {
 
     // 2. Check MarketApp rental contract BoC
     try {
-      const account = await this.client.getAccount(currentOwner)
+      const account = await this.client.getBlockchainAccount(currentOwner)
       if (account?.data) {
         const parsed = BocParser.parseMarketAppRental(account.data, targetWallet, nowSeconds)
         if (parsed) {

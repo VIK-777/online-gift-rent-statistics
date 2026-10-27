@@ -193,6 +193,13 @@ export class TonApiClient {
   }
 
   /**
+   * Fetches blockchain account details (contains smart contract data BoC hex).
+   */
+  async getBlockchainAccount(address: string): Promise<TonAccountInfo | null> {
+    return this.request<TonAccountInfo>(`/blockchain/accounts/${encodeURIComponent(address)}`)
+  }
+
+  /**
    * Fetches account events with pagination.
    */
   async getAccountEvents(
