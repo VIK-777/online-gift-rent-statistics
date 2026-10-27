@@ -103,13 +103,13 @@ export class RentalScanner {
     }
 
     const lastScannedLt = (!forceRefresh && existingState) ? existingState.lastScannedLt : null
-    const candidateNfts = new Set<string>(existingState ? existingState.candidateNfts : [])
-    const contractToNftMap = { ...(existingState?.contractToNftMap || {}) }
-    const nftAddressToNameMap = { ...(existingState?.nftAddressToNameMap || {}) }
+    const candidateNfts = new Set<string>((!forceRefresh && existingState) ? existingState.candidateNfts : [])
+    const contractToNftMap = (!forceRefresh && existingState) ? { ...(existingState.contractToNftMap || {}) } : {}
+    const nftAddressToNameMap = (!forceRefresh && existingState) ? { ...(existingState.nftAddressToNameMap || {}) } : {}
     const allPayoutsMap = new Map<string, RentalPayout>()
     const nftLatestTransfer = new Map<string, { status: 'IN_WALLET' | 'RENTED_OUT'; contract?: string }>()
 
-    if (existingState && existingState.payouts) {
+    if (!forceRefresh && existingState && existingState.payouts) {
       for (const p of existingState.payouts) {
         allPayoutsMap.set(p.eventId, p)
       }
@@ -242,18 +242,41 @@ export class RentalScanner {
           percent: 25 + Math.floor((senderIdx / unmappedSenders.length) * 10)
         })
 
+        let resolvedNft: string | null = null
+
+        // 1. Try Tonnel get_params (stack[0] contains the NFT address cell)
         try {
-          const acc = await this.client.getBlockchainAccount(sender)
-          if (acc?.data) {
-            const extracted = BocParser.extractMarketAppNftAddress(acc.data)
-            if (extracted) {
-              const nftLower = extracted.toLowerCase()
-              contractToNftMap[sender] = nftLower
-              candidateNfts.add(nftLower)
+          const getParams = await this.client.runGetMethod(sender, 'get_params')
+          if (getParams?.success && getParams.stack && getParams.stack.length >= 1) {
+            const cell = getParams.stack[0]?.cell
+            if (cell) {
+              const parsed = BocParser.parseAddressFromCell(cell)
+              if (parsed) {
+                resolvedNft = parsed.toLowerCase()
+                contractToNftMap[sender] = resolvedNft
+                candidateNfts.add(resolvedNft)
+              }
             }
           }
         } catch {
-          // Ignore single payout resolve error
+          // Ignore
+        }
+
+        // 2. Try MarketApp blockchain account data
+        if (!resolvedNft) {
+          try {
+            const acc = await this.client.getBlockchainAccount(sender)
+            if (acc?.data) {
+              const extracted = BocParser.extractMarketAppNftAddress(acc.data)
+              if (extracted) {
+                resolvedNft = extracted.toLowerCase()
+                contractToNftMap[sender] = resolvedNft
+                candidateNfts.add(resolvedNft)
+              }
+            }
+          } catch {
+            // Ignore single payout resolve error
+          }
         }
       }
     }
