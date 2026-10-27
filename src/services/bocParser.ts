@@ -54,16 +54,18 @@ export class BocParser {
 
       // Cell 2: isListed flag (bit 0), expireTime (bit 67..99), renter (bit 135..402), linkedContract (bit 402..669)
       const c2Bits = this.toBits(cells[2].data)
-      const isListed = c2Bits.length > 0 && c2Bits[0] === '1'
-      const status: 'Rented' | 'Listed for Rent' = isListed ? 'Listed for Rent' : 'Rented'
-
+      const isListedBit = c2Bits.length > 0 && c2Bits[0] === '1'
       const expireTime = c2Bits.length >= 99 ? this.readUint32(c2Bits, 67) : 0
 
       let renterAddr: string | null = null
-      if (!isListed && c2Bits.length >= 135 + 267) {
+      if (c2Bits.length >= 135 + 267) {
         const renterRes = this.readAddress(c2Bits, 135)
         renterAddr = renterRes ? renterRes.address : null
       }
+
+      // A gift is actively rented ONLY if it is not relisted, has a non-zero expireTime, and has an assigned renter
+      const isRented = !isListedBit && expireTime > 0 && renterAddr !== null
+      const status: 'Rented' | 'Listed for Rent' = isRented ? 'Rented' : 'Listed for Rent'
 
       let linkedContract: string | null = null
       if (c2Bits.length >= 402 + 267) {
@@ -87,7 +89,7 @@ export class BocParser {
       const rawPrice = Number(priceNano) / 1_000_000_000
       const priceTon = Math.round(rawPrice * 1000) / 1000
 
-      if (isListed) {
+      if (!isRented) {
         const durationDays = Math.max(1, Math.floor(minDuration / 86400))
         return {
           nftAddress: nftAddr,

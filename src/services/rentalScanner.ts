@@ -19,7 +19,7 @@ export interface PersistentWalletState {
   nftAddressToNameMap: Record<string, string>
 }
 
-const STORAGE_PREFIX = 'ton_gift_rent_v3_'
+const STORAGE_PREFIX = 'ton_gift_rent_v4_'
 
 export class RentalScanner {
   private client: TonApiClient
@@ -518,6 +518,17 @@ export class RentalScanner {
     isFromCache: boolean
   ): RentalDashboardResponse {
     const updatedGifts = state.cachedGifts.map(gift => {
+      // Guard: if a gift has status 'Rented' but no expiration or zero/epoch-1970 expiration, it is Listed for Rent
+      if (gift.status === 'Rented' && (!gift.rentExpiresAtUtc || gift.rentExpiresAtUtc.includes('1970'))) {
+        return {
+          ...gift,
+          status: 'Listed for Rent' as const,
+          rentStartedAtUtc: undefined,
+          rentExpiresAtUtc: undefined,
+          rentTimeRemainingSeconds: undefined,
+          renterAddress: undefined
+        }
+      }
       if (gift.status === 'Rented' && gift.rentExpiresAtUtc) {
         const expTime = Math.floor(new Date(gift.rentExpiresAtUtc).getTime() / 1000)
         const remaining = Math.max(0, expTime - nowSeconds)
