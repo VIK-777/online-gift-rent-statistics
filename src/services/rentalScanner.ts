@@ -1,5 +1,5 @@
 import { BocParser } from './bocParser'
-import { TonApiClient } from './tonApiClient'
+import { TonApiClient, TonNftItem } from './tonApiClient'
 import {
   GiftRentalDetail,
   RentalDashboardResponse,
@@ -107,6 +107,7 @@ export class RentalScanner {
     const contractToNftMap = { ...(existingState?.contractToNftMap || {}) }
     const nftAddressToNameMap = { ...(existingState?.nftAddressToNameMap || {}) }
     const allPayoutsMap = new Map<string, RentalPayout>()
+    const nftLatestTransfer = new Map<string, { status: 'IN_WALLET' | 'RENTED_OUT'; contract?: string }>()
 
     if (existingState && existingState.payouts) {
       for (const p of existingState.payouts) {
@@ -115,21 +116,21 @@ export class RentalScanner {
     }
 
     // --- STEP 1: Scan Events ---
-    onProgress({
-      stage: 'scanning_events',
-      message: 'Сканируем историю транзакций и выплат аренды...',
-      current: 1,
-      total: 3,
-      percent: 15
-    })
-
     const newPayouts: RentalPayout[] = []
     const newCandidates = new Set<string>()
     let beforeLt: number | undefined = undefined
     let maxLt: number | null = lastScannedLt
-    const maxPages = lastScannedLt ? 3 : 5
+    const maxPages = lastScannedLt ? 2 : 3
 
     for (let page = 1; page <= maxPages; page++) {
+      onProgress({
+        stage: 'scanning_events',
+        message: `Сканируем историю транзакций (страница ${page} из ${maxPages})...`,
+        current: page,
+        total: maxPages,
+        percent: 10 + page * 5
+      })
+
       const limit = (lastScannedLt && page === 1) ? 25 : 100
       const eventsRes = await this.client.getAccountEvents(targetWallet, limit, beforeLt)
       if (!eventsRes || !eventsRes.events || eventsRes.events.length === 0) break
@@ -149,12 +150,21 @@ export class RentalScanner {
         // Check actions in event
         if (ev.actions) {
           for (const act of ev.actions) {
-            // 1. Detect candidate NFTs transferred out of wallet
+            // 1. Detect candidate NFTs transferred out of wallet or returned back
             if (act.type === 'NftItemTransfer' && act.NftItemTransfer) {
               const nftTrans = act.NftItemTransfer
+              const nftAddr = nftTrans.nft?.toLowerCase()
               const sender = nftTrans.sender?.address?.toLowerCase()
-              if (sender === targetWallet && nftTrans.nft) {
-                newCandidates.add(nftTrans.nft.toLowerCase())
+              const recipient = nftTrans.recipient?.address?.toLowerCase()
+
+              if (nftAddr && !nftLatestTransfer.has(nftAddr)) {
+                if (recipient === targetWallet) {
+                  nftLatestTransfer.set(nftAddr, { status: 'IN_WALLET' })
+                } else if (sender === targetWallet && recipient) {
+                  nftLatestTransfer.set(nftAddr, { status: 'RENTED_OUT', contract: recipient })
+                  contractToNftMap[recipient] = nftAddr
+                  newCandidates.add(nftAddr)
+                }
               }
             }
 
@@ -182,11 +192,6 @@ export class RentalScanner {
                   comment,
                   explorerUrl: `https://tonviewer.com/transaction/${ev.event_id}`
                 })
-
-                // If comment contains marketapp, the sender contract holds/held the NFT
-                if (comment.toLowerCase().includes('marketapp.org') && sender) {
-                  contractToNftMap[sender] = '' // mark to resolve
-                }
               }
             }
           }
@@ -206,58 +211,98 @@ export class RentalScanner {
       allPayoutsMap.set(p.eventId, p)
     }
 
-    // Resolve contract to NFT for payouts with unknown NFT
-    for (const payout of newPayouts) {
-      if (!payout.nftAddress && payout.senderAddress) {
-        const knownNft = contractToNftMap[payout.senderAddress]
-        if (knownNft) {
-          payout.nftAddress = knownNft
-        } else {
-          // Query account to parse Cell 1 of contract
-          try {
-            const acc = await this.client.getAccount(payout.senderAddress)
-            if (acc?.data) {
-              const extracted = BocParser.extractMarketAppNftAddress(acc.data)
-              if (extracted) {
-                payout.nftAddress = extracted.toLowerCase()
-                contractToNftMap[payout.senderAddress] = extracted.toLowerCase()
-                candidateNfts.add(extracted.toLowerCase())
-              }
+    // Resolve contract to NFT for payouts with unknown NFT (deduplicating unique senders)
+    const unmappedSenders = Array.from(new Set(
+      newPayouts
+        .filter(p => !p.nftAddress && p.senderAddress && !contractToNftMap[p.senderAddress])
+        .map(p => p.senderAddress)
+    ))
+
+    if (unmappedSenders.length > 0) {
+      let senderIdx = 0
+      for (const sender of unmappedSenders) {
+        senderIdx++
+        onProgress({
+          stage: 'scanning_events',
+          message: `Распознаем контракты выплат (${senderIdx} из ${unmappedSenders.length})...`,
+          current: senderIdx,
+          total: unmappedSenders.length,
+          percent: 25 + Math.floor((senderIdx / unmappedSenders.length) * 10)
+        })
+
+        try {
+          const acc = await this.client.getAccount(sender)
+          if (acc?.data) {
+            const extracted = BocParser.extractMarketAppNftAddress(acc.data)
+            if (extracted) {
+              const nftLower = extracted.toLowerCase()
+              contractToNftMap[sender] = nftLower
+              candidateNfts.add(nftLower)
             }
-          } catch {
-            // Ignore single payout resolve error
           }
+        } catch {
+          // Ignore single payout resolve error
         }
       }
     }
 
+    // Now map all payouts to resolved NFT addresses
+    for (const payout of newPayouts) {
+      if (!payout.nftAddress && payout.senderAddress && contractToNftMap[payout.senderAddress]) {
+        payout.nftAddress = contractToNftMap[payout.senderAddress]
+      }
+    }
+
     // --- STEP 2: Inspect candidate NFTs for active rental ---
-    const candidateList = Array.from(candidateNfts)
-    const totalCandidates = candidateList.length
+    // Only inspect NFTs that are currently transferred OUT of the wallet
+    const activeCandidates = Array.from(candidateNfts).filter(nft => {
+      const state = nftLatestTransfer.get(nft)
+      return !state || state.status !== 'IN_WALLET'
+    })
+
+    const totalCandidates = activeCandidates.length
     const activeGifts: GiftRentalDetail[] = []
 
     onProgress({
       stage: 'inspecting_contracts',
-      message: `Проверяем статус подарков (найдено кандидатов: ${totalCandidates})...`,
+      message: `Загружаем подарки в аренде (${totalCandidates} шт.)...`,
       current: 0,
       total: totalCandidates,
       percent: 35
     })
 
+    // Fetch NFT metadata in bulk (1 single request instead of N individual queries!)
+    const bulkNfts = await this.client.getNftsBulk(activeCandidates)
+    const nftMap = new Map<string, TonNftItem>()
+    for (const item of bulkNfts) {
+      if (item.address) {
+        nftMap.set(item.address.toLowerCase(), item)
+      }
+    }
+
     let candidateIdx = 0
-    for (const nftAddr of candidateList) {
+    for (const nftAddr of activeCandidates) {
       candidateIdx++
-      const pct = 35 + Math.floor((candidateIdx / Math.max(1, totalCandidates)) * 50)
+      const pct = 35 + Math.floor((candidateIdx / Math.max(1, totalCandidates)) * 55)
+      const cachedNft = nftMap.get(nftAddr)
+      const giftLabel = cachedNft?.metadata?.name || `Подарок #${candidateIdx}`
+
       onProgress({
         stage: 'inspecting_contracts',
-        message: `Проверка подарка ${candidateIdx} из ${totalCandidates}...`,
+        message: `Проверяем статус: ${giftLabel} (${candidateIdx}/${totalCandidates})...`,
         current: candidateIdx,
         total: totalCandidates,
         percent: pct
       })
 
       try {
-        const giftDetail = await this.inspectNftRental(nftAddr, targetWallet, nowSeconds, contractToNftMap)
+        const giftDetail = await this.inspectNftRental(
+          nftAddr,
+          targetWallet,
+          nowSeconds,
+          contractToNftMap,
+          cachedNft
+        )
         if (giftDetail) {
           activeGifts.push(giftDetail)
           nftAddressToNameMap[nftAddr] = giftDetail.name
@@ -313,7 +358,7 @@ export class RentalScanner {
       lastScannedTimestamp: nowSeconds,
       payouts: allPayouts,
       cachedGifts: activeGifts,
-      candidateNfts: candidateList,
+      candidateNfts: Array.from(candidateNfts),
       contractToNftMap,
       nftAddressToNameMap
     }
@@ -337,9 +382,10 @@ export class RentalScanner {
     nftAddress: string,
     targetWallet: string,
     nowSeconds: number,
-    contractToNftMap: Record<string, string>
+    contractToNftMap: Record<string, string>,
+    prefetchedNft?: TonNftItem
   ): Promise<GiftRentalDetail | null> {
-    const nft = await this.client.getNft(nftAddress)
+    const nft = prefetchedNft || await this.client.getNft(nftAddress)
     if (!nft || !nft.owner || !nft.owner.address) return null
 
     const currentOwner = nft.owner.address.toLowerCase()

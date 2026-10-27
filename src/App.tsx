@@ -69,11 +69,18 @@ export function App() {
   const apiClient = useMemo(() => new TonApiClient(settings), [settings])
   const scanner = useMemo(() => new RentalScanner(apiClient), [apiClient])
 
-  // 1. Fetch TON price on mount
+  // 1. Fetch TON price (load cached immediately, update in background after 3s)
   useEffect(() => {
-    apiClient.getTonPriceUsd().then(price => {
-      if (price) setTonPriceUsd(price)
-    }).catch(() => {})
+    const cached = localStorage.getItem('ton_cached_price_usd')
+    if (cached) {
+      setTonPriceUsd(parseFloat(cached))
+    }
+    const timer = setTimeout(() => {
+      apiClient.getTonPriceUsd().then(price => {
+        if (price) setTonPriceUsd(price)
+      }).catch(() => {})
+    }, 3000)
+    return () => clearTimeout(timer)
   }, [apiClient])
 
   // 2. Auto-load wallet if present on start

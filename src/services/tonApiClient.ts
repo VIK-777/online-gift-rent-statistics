@@ -64,22 +64,23 @@ export interface TonGetMethodResult {
 export class TonApiClient {
   private baseUrl = 'https://tonapi.io/v2'
   private apiKey: string = ''
-  private throttleMs: number = 900 // Default 900ms safe interval for anonymous tier (1 RPS)
-  private queue: Promise<unknown> = Promise.resolve()
-  private lastRequestTime: number = 0
+  private throttleMs: number = 1200 // Default 1.2s safe interval for anonymous tier (<1 RPS)
+  private queue: Array<() => Promise<void>> = []
+  private isProcessingQueue = false
+  private lastRequestEndTime: number = 0
 
   constructor(settings?: Partial<AppSettings>) {
     if (settings?.customApiKey) {
       this.apiKey = settings.customApiKey.trim()
-      this.throttleMs = settings.throttleMs || 700
+      this.throttleMs = settings.throttleMs || 750
     } else {
-      this.throttleMs = settings?.throttleMs || 900
+      this.throttleMs = settings?.throttleMs || 1200
     }
   }
 
   setApiKey(key: string) {
     this.apiKey = key.trim()
-    this.throttleMs = this.apiKey ? 700 : 900
+    this.throttleMs = this.apiKey ? 750 : 1200
   }
 
   setThrottle(ms: number) {
@@ -87,68 +88,101 @@ export class TonApiClient {
   }
 
   /**
-   * Enqueues an HTTP request to TonAPI with rate limiting and retry-on-429 logic.
+   * Safe asynchronous task queue that strictly prevents concurrent requests,
+   * enforces inter-request delay, and handles 429 retries inline without deadlock.
    */
-  private async request<T>(endpoint: string, options: RequestInit = {}, retries = 3): Promise<T | null> {
-    return new Promise<T | null>((resolve, reject) => {
-      this.queue = this.queue.then(async () => {
+  private request<T>(endpoint: string, options: RequestInit = {}): Promise<T | null> {
+    return new Promise<T | null>((resolve) => {
+      this.queue.push(async () => {
+        const result = await this.executeWithRetry<T>(endpoint, options)
+        resolve(result)
+      })
+      this.processQueue()
+    })
+  }
+
+  private async processQueue() {
+    if (this.isProcessingQueue) return
+    this.isProcessingQueue = true
+
+    while (this.queue.length > 0) {
+      const task = this.queue.shift()
+      if (task) {
+        // Enforce safe throttle delay from completion of the previous request
         const now = Date.now()
-        const wait = Math.max(0, this.throttleMs - (now - this.lastRequestTime))
-        if (wait > 0) {
-          await new Promise(r => setTimeout(r, wait))
-        }
-        this.lastRequestTime = Date.now()
-
-        const headers: Record<string, string> = {
-          'Accept': 'application/json',
-          ...(options.headers as Record<string, string> || {})
-        }
-
-        if (this.apiKey) {
-          headers['Authorization'] = `Bearer ${this.apiKey}`
+        const timeSinceLast = now - this.lastRequestEndTime
+        if (timeSinceLast < this.throttleMs) {
+          const waitTime = this.throttleMs - timeSinceLast
+          await new Promise(r => setTimeout(r, waitTime))
         }
 
         try {
-          const res = await fetch(`${this.baseUrl}${endpoint}`, {
-            ...options,
-            headers
-          })
-
-          if (res.status === 429) {
-            console.warn(`[TonApiClient] 429 Rate limit reached on ${endpoint}. Retrying... (retries left: ${retries})`)
-            if (retries > 0) {
-              // Wait 1.5 seconds for leaky bucket to refill, then retry
-              await new Promise(r => setTimeout(r, 1500))
-              const retryRes = await this.request<T>(endpoint, options, retries - 1)
-              resolve(retryRes)
-              return
-            } else {
-              console.error(`[TonApiClient] Rate limit exceeded, no retries left for ${endpoint}`)
-              resolve(null)
-              return
-            }
-          }
-
-          if (!res.ok) {
-            console.warn(`[TonApiClient] HTTP ${res.status} on ${endpoint}: ${res.statusText}`)
-            resolve(null)
-            return
-          }
-
-          const data = await res.json()
-          resolve(data as T)
+          await task()
         } catch (err) {
-          console.error(`[TonApiClient] Network error on ${endpoint}:`, err)
-          if (retries > 0) {
-            await new Promise(r => setTimeout(r, 1000))
-            const retryRes = await this.request<T>(endpoint, options, retries - 1)
-            resolve(retryRes)
+          console.error('[TonApiClient] Unhandled task error in queue:', err)
+        } finally {
+          this.lastRequestEndTime = Date.now()
+        }
+      }
+    }
+
+    this.isProcessingQueue = false
+  }
+
+  /**
+   * Executes fetch with inline retry loop on 429 (exponential backoff, no queue deadlock).
+   */
+  private async executeWithRetry<T>(endpoint: string, options: RequestInit = {}, maxRetries = 3): Promise<T | null> {
+    let attemptsLeft = maxRetries
+
+    while (attemptsLeft >= 0) {
+      const headers: Record<string, string> = {
+        'Accept': 'application/json',
+        ...(options.headers as Record<string, string> || {})
+      }
+
+      if (this.apiKey) {
+        headers['Authorization'] = `Bearer ${this.apiKey}`
+      }
+
+      try {
+        const res = await fetch(`${this.baseUrl}${endpoint}`, {
+          ...options,
+          headers
+        })
+
+        if (res.status === 429) {
+          console.warn(`[TonApiClient] 429 Rate limit on ${endpoint}. Attempts left: ${attemptsLeft}`)
+          if (attemptsLeft > 0) {
+            attemptsLeft--
+            // Pause 2.5 seconds to let the TonAPI token bucket refill
+            await new Promise(r => setTimeout(r, 2500))
+            continue
           } else {
-            resolve(null)
+            console.error(`[TonApiClient] 429 Rate limit exceeded permanently on ${endpoint}`)
+            return null
           }
         }
-      }).catch(reject)
-    })
+
+        if (!res.ok) {
+          console.warn(`[TonApiClient] HTTP ${res.status} on ${endpoint}: ${res.statusText}`)
+          return null
+        }
+
+        const data = await res.json()
+        return data as T
+      } catch (err) {
+        console.warn(`[TonApiClient] Network fetch error on ${endpoint}:`, err)
+        if (attemptsLeft > 0) {
+          attemptsLeft--
+          await new Promise(r => setTimeout(r, 1500))
+          continue
+        }
+        return null
+      }
+    }
+
+    return null
   }
 
   /**
@@ -181,6 +215,23 @@ export class TonApiClient {
   }
 
   /**
+   * Fetches multiple NFT items in a single batch request via POST /v2/nfts/_bulk.
+   */
+  async getNftsBulk(nftAddresses: string[]): Promise<TonNftItem[]> {
+    if (nftAddresses.length === 0) return []
+    try {
+      const res = await this.request<{ nft_items: TonNftItem[] }>('/nfts/_bulk', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ account_ids: nftAddresses })
+      })
+      return res?.nft_items || []
+    } catch {
+      return []
+    }
+  }
+
+  /**
    * Executes a get-method on an account (e.g. get_params for Tonnel rental contracts).
    */
   async runGetMethod(address: string, method: string): Promise<TonGetMethodResult | null> {
@@ -188,12 +239,27 @@ export class TonApiClient {
   }
 
   /**
-   * Fetches latest TON/USD price.
+   * Fetches latest TON/USD price with simple memory/local caching.
    */
   async getTonPriceUsd(): Promise<number | null> {
     try {
+      const cached = localStorage.getItem('ton_cached_price_usd')
+      const cachedTime = localStorage.getItem('ton_cached_price_time')
+      const now = Date.now()
+
+      // If cached less than 30 minutes ago, return cached price immediately
+      if (cached && cachedTime && (now - parseInt(cachedTime, 10) < 30 * 60 * 1000)) {
+        return parseFloat(cached)
+      }
+
       const data = await this.request<{ rates: { TON: { prices: { USD: number } } } }>('/rates?tokens=ton&currencies=usd')
-      return data?.rates?.TON?.prices?.USD ?? null
+      const price = data?.rates?.TON?.prices?.USD
+      if (price) {
+        localStorage.setItem('ton_cached_price_usd', price.toString())
+        localStorage.setItem('ton_cached_price_time', now.toString())
+        return price
+      }
+      return cached ? parseFloat(cached) : null
     } catch {
       return null
     }
