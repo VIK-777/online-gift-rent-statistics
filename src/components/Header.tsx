@@ -7,6 +7,18 @@ interface HeaderProps {
   onRefresh: () => void
   onOpenSettings: () => void
   hasData: boolean
+  cachedAt?: number
+  isFromCache?: boolean
+}
+
+function formatTimeAgo(timestampSeconds?: number): string {
+  if (!timestampSeconds) return ''
+  const diffSec = Math.max(0, Math.floor(Date.now() / 1000) - timestampSeconds)
+  if (diffSec < 60) return 'только что'
+  const mins = Math.floor(diffSec / 60)
+  if (mins < 60) return `${mins} мин назад`
+  const hours = Math.floor(mins / 60)
+  return `${hours} ч назад`
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -14,7 +26,8 @@ export const Header: React.FC<HeaderProps> = ({
   isLoading,
   onRefresh,
   onOpenSettings,
-  hasData
+  hasData,
+  cachedAt
 }) => {
   return (
     <header className="sticky top-0 z-30 bg-[#0B111A]/85 backdrop-blur-md border-b border-slate-800/80 px-4 py-3">
@@ -40,6 +53,16 @@ export const Header: React.FC<HeaderProps> = ({
 
         {/* Actions & Price */}
         <div className="flex items-center gap-2">
+          {hasData && cachedAt && (
+            <div
+              title={`Данные сохранены в браузере (кэш: ${formatTimeAgo(cachedAt)})`}
+              className="hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-xs font-medium"
+            >
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+              <span>Кэш: {formatTimeAgo(cachedAt)}</span>
+            </div>
+          )}
+
           {tonPriceUsd !== null && (
             <div className="hidden sm:flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-900 border border-slate-800 text-xs font-medium text-slate-300">
               <span className="text-sky-400 font-semibold">TON</span>

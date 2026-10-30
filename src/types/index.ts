@@ -4,6 +4,8 @@ export interface RentalPayout {
   dateUtc: string
   amountTon: number
   senderAddress: string
+  renterAddress?: string
+  durationDays?: number
   comment: string
   nftAddress?: string
   giftName?: string

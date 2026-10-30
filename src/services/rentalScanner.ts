@@ -10,6 +10,7 @@ import {
 
 export interface PersistentWalletState {
   walletAddress: string
+  friendlyAddress?: string
   lastScannedLt: number | null
   lastScannedTimestamp: number
   payouts: RentalPayout[]
@@ -20,6 +21,7 @@ export interface PersistentWalletState {
 }
 
 const STORAGE_PREFIX = 'ton_gift_rent_v4_'
+const WALLET_MAP_PREFIX = 'ton_gift_wallet_map_'
 
 export class RentalScanner {
   private client: TonApiClient
@@ -33,12 +35,35 @@ export class RentalScanner {
    */
   async resolveWallet(input: string): Promise<{ rawAddress: string; friendlyAddress: string }> {
     const clean = input.trim()
+    const cleanLower = clean.toLowerCase()
+
+    // 1. Check local alias map for instant resolution without network call
+    const cachedRaw = localStorage.getItem(`${WALLET_MAP_PREFIX}${cleanLower}`)
+    if (cachedRaw) {
+      return { rawAddress: cachedRaw.toLowerCase(), friendlyAddress: clean }
+    }
+
+    // 2. Direct raw hex format 0:...
+    if (/^[0-9a-fA-F-]+:[0-9a-fA-F]{64}$/.test(clean)) {
+      const raw = cleanLower
+      try {
+        localStorage.setItem(`${WALLET_MAP_PREFIX}${raw}`, raw)
+      } catch {}
+      return { rawAddress: raw, friendlyAddress: clean }
+    }
+
+    // 3. Query TonAPI to resolve address
     const account = await this.client.getAccount(clean)
     if (!account || !account.address) {
       throw new Error(`Не удалось найти аккаунт для "${clean}". Проверьте адрес кошелька.`)
     }
+    const raw = account.address.toLowerCase()
+    try {
+      localStorage.setItem(`${WALLET_MAP_PREFIX}${cleanLower}`, raw)
+      localStorage.setItem(`${WALLET_MAP_PREFIX}${raw}`, raw)
+    } catch {}
     return {
-      rawAddress: account.address.toLowerCase(),
+      rawAddress: raw,
       friendlyAddress: clean
     }
   }
@@ -48,9 +73,41 @@ export class RentalScanner {
    */
   loadSavedState(walletAddress: string): PersistentWalletState | null {
     try {
-      const raw = localStorage.getItem(`${STORAGE_PREFIX}${walletAddress.toLowerCase()}`)
-      if (!raw) return null
-      return JSON.parse(raw) as PersistentWalletState
+      const clean = walletAddress.trim().toLowerCase()
+      // Direct raw key lookup
+      let rawJson = localStorage.getItem(`${STORAGE_PREFIX}${clean}`)
+
+      // Try via alias map
+      if (!rawJson) {
+        const mapped = localStorage.getItem(`${WALLET_MAP_PREFIX}${clean}`)
+        if (mapped) {
+          rawJson = localStorage.getItem(`${STORAGE_PREFIX}${mapped.toLowerCase()}`)
+        }
+      }
+
+      // Search all STORAGE_PREFIX keys in localStorage as fallback
+      if (!rawJson) {
+        for (let i = 0; i < localStorage.length; i++) {
+          const key = localStorage.key(i)
+          if (key && key.startsWith(STORAGE_PREFIX)) {
+            const item = localStorage.getItem(key)
+            if (item) {
+              try {
+                const parsed = JSON.parse(item) as PersistentWalletState
+                if (
+                  parsed.walletAddress?.toLowerCase() === clean ||
+                  parsed.friendlyAddress?.toLowerCase() === clean
+                ) {
+                  return parsed
+                }
+              } catch {}
+            }
+          }
+        }
+      }
+
+      if (!rawJson) return null
+      return JSON.parse(rawJson) as PersistentWalletState
     } catch {
       return null
     }
@@ -61,10 +118,24 @@ export class RentalScanner {
    */
   saveState(state: PersistentWalletState) {
     try {
-      localStorage.setItem(`${STORAGE_PREFIX}${state.walletAddress.toLowerCase()}`, JSON.stringify(state))
+      const raw = state.walletAddress.toLowerCase()
+      localStorage.setItem(`${STORAGE_PREFIX}${raw}`, JSON.stringify(state))
+      if (state.friendlyAddress) {
+        localStorage.setItem(`${WALLET_MAP_PREFIX}${state.friendlyAddress.toLowerCase()}`, raw)
+      }
     } catch (e) {
       console.warn('[RentalScanner] Failed to save state to localStorage:', e)
     }
+  }
+
+  /**
+   * Gets cached dashboard data synchronously from localStorage if available.
+   */
+  getCachedDashboard(walletAddress: string): RentalDashboardResponse | null {
+    const state = this.loadSavedState(walletAddress)
+    if (!state) return null
+    const nowSeconds = Math.floor(Date.now() / 1000)
+    return this.buildResponseFromState(state, state.walletAddress, nowSeconds, true)
   }
 
   /**
@@ -73,10 +144,13 @@ export class RentalScanner {
   async scanDashboard(
     walletAddress: string,
     onProgress: (progress: ScanProgress) => void,
-    forceRefresh = false
+    forceRefresh = false,
+    ttlMinutes = 10,
+    friendlyAddress?: string
   ): Promise<RentalDashboardResponse> {
     const nowSeconds = Math.floor(Date.now() / 1000)
     const targetWallet = walletAddress.toLowerCase()
+    const ttlSeconds = Math.max(30, ttlMinutes * 60)
 
     onProgress({
       stage: 'resolving',
@@ -87,11 +161,22 @@ export class RentalScanner {
     })
 
     const existingState = this.loadSavedState(targetWallet)
-    const hasCachedData = existingState && existingState.cachedGifts && existingState.cachedGifts.length > 0
+    if (existingState && friendlyAddress && !existingState.friendlyAddress) {
+      existingState.friendlyAddress = friendlyAddress
+    }
 
-    // Fast-path: if cached state is fresh (< 2 mins) and not force refresh, recalculate remaining times in memory
+    const hasCachedData = !!(
+      existingState &&
+      (
+        (existingState.cachedGifts && existingState.cachedGifts.length > 0) ||
+        (existingState.payouts && existingState.payouts.length > 0) ||
+        existingState.lastScannedLt !== null
+      )
+    )
+
+    // Fast-path 1: if cached state is fresh (< ttlSeconds) and not force refresh, recalculate remaining times in memory
     const cacheAgeSeconds = existingState ? (nowSeconds - existingState.lastScannedTimestamp) : 999999
-    if (!forceRefresh && hasCachedData && cacheAgeSeconds < 120) {
+    if (!forceRefresh && hasCachedData && cacheAgeSeconds < ttlSeconds) {
       onProgress({
         stage: 'done',
         message: 'Загружено из локального кэша',
@@ -99,7 +184,7 @@ export class RentalScanner {
         total: 100,
         percent: 100
       })
-      return this.buildResponseFromState(existingState, targetWallet, nowSeconds, true)
+      return this.buildResponseFromState(existingState!, targetWallet, nowSeconds, true)
     }
 
     const lastScannedLt = (!forceRefresh && existingState) ? existingState.lastScannedLt : null
@@ -117,9 +202,10 @@ export class RentalScanner {
     // --- STEP 1: Scan Events ---
     const newPayouts: RentalPayout[] = []
     const newCandidates = new Set<string>()
+    const returnedNfts = new Set<string>()
     let beforeLt: number | undefined = undefined
     let maxLt: number | null = lastScannedLt
-    const maxPages = lastScannedLt ? 3 : 5
+    const maxPages = lastScannedLt ? 2 : 5
 
     for (let page = 1; page <= maxPages; page++) {
       onProgress({
@@ -149,17 +235,22 @@ export class RentalScanner {
         // Check actions in event
         if (ev.actions) {
           for (const act of ev.actions) {
-            // 1. Detect candidate NFTs transferred out of the wallet (Kotlin parity)
+            // 1. Detect candidate NFTs transferred out of the wallet or returned (Kotlin parity)
             if (act.type === 'NftItemTransfer' && act.NftItemTransfer) {
               const nftTrans = act.NftItemTransfer
               const nftAddr = nftTrans.nft?.toLowerCase()
               const sender = nftTrans.sender?.address?.toLowerCase()
               const recipient = nftTrans.recipient?.address?.toLowerCase()
 
-              if (nftAddr && sender === targetWallet) {
-                newCandidates.add(nftAddr)
-                if (recipient) {
-                  contractToNftMap[recipient] = nftAddr
+              if (nftAddr) {
+                if (sender === targetWallet) {
+                  newCandidates.add(nftAddr)
+                  if (recipient) {
+                    contractToNftMap[recipient] = nftAddr
+                  }
+                }
+                if (recipient === targetWallet) {
+                  returnedNfts.add(nftAddr)
                 }
               }
             }
@@ -179,12 +270,29 @@ export class RentalScanner {
                 const amountTon = (tt.amount || 0) / 1_000_000_000
                 const dateStr = new Date(ev.timestamp * 1000).toUTCString()
 
+                // Extract real renter wallet from SmartContractExec in this event
+                let renterWallet: string | undefined = undefined
+                if (ev.actions) {
+                  for (const a of ev.actions) {
+                    if (a.type === 'SmartContractExec' && a.SmartContractExec) {
+                      const ex = a.SmartContractExec.executor
+                      const exAddr = ex?.address?.toLowerCase()
+                      const isWallet = (ex as any)?.is_wallet ?? false
+                      if (exAddr && exAddr !== targetWallet && exAddr !== sender && isWallet) {
+                        renterWallet = exAddr
+                        break
+                      }
+                    }
+                  }
+                }
+
                 newPayouts.push({
                   eventId: ev.event_id,
                   timestamp: ev.timestamp,
                   dateUtc: dateStr,
                   amountTon: Math.round(amountTon * 1000) / 1000,
                   senderAddress: sender,
+                  renterAddress: renterWallet,
                   comment,
                   explorerUrl: `https://tonviewer.com/transaction/${ev.event_id}`
                 })
@@ -199,9 +307,116 @@ export class RentalScanner {
       beforeLt = eventsRes.next_from
     }
 
+    const hasNewTransactions = newPayouts.length > 0 || newCandidates.size > 0 || returnedNfts.size > 0
+
+    // Find any rented gifts in cache whose rental period has expired
+    const expiredRentedGifts = (existingState?.cachedGifts || []).filter(gift => {
+      if (gift.status !== 'Rented' || !gift.rentExpiresAtUtc) return false
+      const expEpoch = Math.floor(new Date(gift.rentExpiresAtUtc).getTime() / 1000)
+      return expEpoch > 0 && nowSeconds >= expEpoch
+    })
+
+    // Fast-path 2 (Kotlin parity):
+    // If state exists, forceRefresh is false, and no new rental payouts/transfers occurred
+    if (!forceRefresh && existingState && !hasNewTransactions) {
+      if (expiredRentedGifts.length === 0) {
+        // Case A: No new transactions AND no gift rentals have expired!
+        // No need to inspect ANY contracts on-chain.
+        const updatedState: PersistentWalletState = {
+          ...existingState,
+          friendlyAddress: friendlyAddress || existingState.friendlyAddress,
+          lastScannedLt: maxLt || existingState.lastScannedLt,
+          lastScannedTimestamp: nowSeconds
+        }
+        this.saveState(updatedState)
+
+        onProgress({
+          stage: 'done',
+          message: 'Все транзакции актуальны и аренда активна (кэш проверен)',
+          current: 100,
+          total: 100,
+          percent: 100
+        })
+        return this.buildResponseFromState(updatedState, targetWallet, nowSeconds, true)
+      } else {
+        // Case B: No new transactions, BUT one or more rented gifts expired!
+        // Inspect ONLY the specific expired gifts!
+        onProgress({
+          stage: 'inspecting_contracts',
+          message: `Проверяем только истекшие подарки (${expiredRentedGifts.length} шт.)...`,
+          current: 0,
+          total: expiredRentedGifts.length,
+          percent: 50
+        })
+
+        const updatedCachedGifts = [...existingState.cachedGifts]
+        for (let i = 0; i < expiredRentedGifts.length; i++) {
+          const expGift = expiredRentedGifts[i]
+          const pct = 50 + Math.floor(((i + 1) / expiredRentedGifts.length) * 45)
+          onProgress({
+            stage: 'inspecting_contracts',
+            message: `Проверяем статус истекшего: ${expGift.name}...`,
+            current: i + 1,
+            total: expiredRentedGifts.length,
+            percent: pct
+          })
+
+          try {
+            const freshDetail = await this.inspectNftRental(
+              expGift.nftAddress,
+              targetWallet,
+              nowSeconds,
+              contractToNftMap
+            )
+
+            const idx = updatedCachedGifts.findIndex(g => g.nftAddress.toLowerCase() === expGift.nftAddress.toLowerCase())
+            if (freshDetail) {
+              freshDetail.history = expGift.history
+              freshDetail.totalEarnedTon = expGift.totalEarnedTon
+              freshDetail.timesRented = expGift.timesRented
+              if (idx >= 0) {
+                updatedCachedGifts[idx] = freshDetail
+              } else {
+                updatedCachedGifts.push(freshDetail)
+              }
+            } else {
+              // NFT is no longer held in rental contract
+              if (idx >= 0) {
+                updatedCachedGifts.splice(idx, 1)
+              }
+            }
+          } catch (err) {
+            console.warn(`[RentalScanner] Failed to re-check expired gift ${expGift.name}:`, err)
+          }
+        }
+
+        const updatedState: PersistentWalletState = {
+          ...existingState,
+          friendlyAddress: friendlyAddress || existingState.friendlyAddress,
+          lastScannedLt: maxLt || existingState.lastScannedLt,
+          lastScannedTimestamp: nowSeconds,
+          cachedGifts: updatedCachedGifts,
+          contractToNftMap
+        }
+        this.saveState(updatedState)
+
+        onProgress({
+          stage: 'done',
+          message: 'Статус истекших подарков обновлен',
+          current: expiredRentedGifts.length,
+          total: expiredRentedGifts.length,
+          percent: 100
+        })
+        return this.buildResponseFromState(updatedState, targetWallet, nowSeconds, false)
+      }
+    }
+
     // Merge candidates and payouts
     for (const c of newCandidates) {
       candidateNfts.add(c)
+    }
+    for (const ret of returnedNfts) {
+      candidateNfts.delete(ret)
     }
     for (const p of newPayouts) {
       allPayoutsMap.set(p.eventId, p)
@@ -383,6 +598,7 @@ export class RentalScanner {
     // Save updated state to localStorage
     const updatedState: PersistentWalletState = {
       walletAddress: targetWallet,
+      friendlyAddress: friendlyAddress || existingState?.friendlyAddress,
       lastScannedLt: maxLt || existingState?.lastScannedLt || null,
       lastScannedTimestamp: nowSeconds,
       payouts: allPayouts,
@@ -511,7 +727,7 @@ export class RentalScanner {
     return null
   }
 
-  private buildResponseFromState(
+  public buildResponseFromState(
     state: PersistentWalletState,
     walletAddress: string,
     nowSeconds: number,

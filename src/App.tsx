@@ -43,7 +43,24 @@ export function App() {
     return localStorage.getItem(LAST_WALLET_KEY) || ''
   })
 
-  const [data, setData] = useState<RentalDashboardResponse | null>(null)
+  // Initialize clients
+  const apiClient = useMemo(() => new TonApiClient(settings), [settings])
+  const scanner = useMemo(() => new RentalScanner(apiClient), [apiClient])
+
+  // Synchronously load cached dashboard on mount (instant display, no reload wait)
+  const [data, setData] = useState<RentalDashboardResponse | null>(() => {
+    const params = new URLSearchParams(window.location.search)
+    const initialWallet = params.get('wallet') || window.location.hash.replace('#', '') || localStorage.getItem(LAST_WALLET_KEY) || ''
+    if (!initialWallet) return null
+    try {
+      const client = new TonApiClient(defaultSettings)
+      const sc = new RentalScanner(client)
+      return sc.getCachedDashboard(initialWallet)
+    } catch {
+      return null
+    }
+  })
+
   const [tonPriceUsd, setTonPriceUsd] = useState<number | null>(null)
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -64,10 +81,6 @@ export function App() {
   // Modals
   const [isPayoutsModalOpen, setIsPayoutsModalOpen] = useState(false)
   const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false)
-
-  // Initialize clients
-  const apiClient = useMemo(() => new TonApiClient(settings), [settings])
-  const scanner = useMemo(() => new RentalScanner(apiClient), [apiClient])
 
   // 1. Fetch TON price (load cached immediately, update in background after 3s)
   useEffect(() => {
@@ -132,6 +145,14 @@ export function App() {
     setError(null)
 
     try {
+      // Fast path: load cached dashboard immediately if data isn't set yet
+      if (!forceRefresh) {
+        const cached = scanner.getCachedDashboard(inputWallet)
+        if (cached) {
+          setData(cached)
+        }
+      }
+
       // Step A: resolve target wallet
       setProgress({
         stage: 'resolving',
@@ -145,16 +166,25 @@ export function App() {
       setCurrentWallet(resolved.rawAddress)
       localStorage.setItem(LAST_WALLET_KEY, resolved.rawAddress)
 
+      if (!forceRefresh) {
+        const cached = scanner.getCachedDashboard(resolved.rawAddress)
+        if (cached) {
+          setData(cached)
+        }
+      }
+
       // Update URL hash without full reload
       try {
         window.history.replaceState(null, '', `?wallet=${encodeURIComponent(inputWallet.trim())}`)
       } catch {}
 
-      // Step B: Scan dashboard
+      // Step B: Scan dashboard with cache TTL and fast incremental check
       const result = await scanner.scanDashboard(
         resolved.rawAddress,
         (p) => setProgress(p),
-        forceRefresh
+        forceRefresh,
+        settings.cacheTtlMinutes,
+        resolved.friendlyAddress
       )
 
       setData(result)
@@ -177,8 +207,26 @@ export function App() {
 
   const handleClearCache = () => {
     if (currentWallet) {
-      localStorage.removeItem(`ton_gift_rent_${currentWallet.toLowerCase()}`)
+      const clean = currentWallet.toLowerCase()
+      localStorage.removeItem(`ton_gift_rent_v4_${clean}`)
+      const mapped = localStorage.getItem(`ton_gift_wallet_map_${clean}`)
+      if (mapped) {
+        localStorage.removeItem(`ton_gift_rent_v4_${mapped.toLowerCase()}`)
+        localStorage.removeItem(`ton_gift_wallet_map_${clean}`)
+      }
     }
+    try {
+      const keysToRemove: string[] = []
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i)
+        if (k && (k.startsWith('ton_gift_rent_') || k.startsWith('ton_gift_wallet_map_'))) {
+          keysToRemove.push(k)
+        }
+      }
+      for (const k of keysToRemove) {
+        localStorage.removeItem(k)
+      }
+    } catch {}
     setData(null)
     setError(null)
   }
@@ -232,6 +280,8 @@ export function App() {
         onRefresh={() => handleSearch(currentWallet, true)}
         onOpenSettings={() => setIsSettingsModalOpen(true)}
         hasData={data !== null}
+        cachedAt={data?.cachedAt}
+        isFromCache={data?.isFromCache}
       />
 
       <main className="flex-1 pb-16">
