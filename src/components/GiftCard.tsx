@@ -35,6 +35,9 @@ export const GiftCard: React.FC<GiftCardProps> = ({
 }) => {
   const [showHistory, setShowHistory] = useState(false)
   const isRented = gift.status === 'Rented'
+  const isListed = gift.status === 'Listed for Rent'
+  const isNotOwned = gift.status === 'Not Owned'
+  const isInWallet = gift.status === 'In Wallet'
   const earnedUsd = tonPriceUsd ? gift.totalEarnedTon * tonPriceUsd : null
 
   return (
@@ -61,7 +64,13 @@ export const GiftCard: React.FC<GiftCardProps> = ({
           {/* Mini status dot overlay */}
           <span
             className={`absolute bottom-1 right-1 w-2.5 h-2.5 rounded-full ring-2 ring-slate-900 ${
-              isRented ? 'bg-emerald-400' : 'bg-amber-400'
+              isRented
+                ? 'bg-emerald-400'
+                : isListed
+                ? 'bg-amber-400'
+                : isNotOwned
+                ? 'bg-purple-400'
+                : 'bg-sky-400'
             }`}
           />
         </div>
@@ -89,20 +98,34 @@ export const GiftCard: React.FC<GiftCardProps> = ({
               className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-semibold ${
                 isRented
                   ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/30'
-                  : 'bg-amber-500/15 text-amber-300 border border-amber-500/30'
+                  : isListed
+                  ? 'bg-amber-500/15 text-amber-300 border border-amber-500/30'
+                  : isNotOwned
+                  ? 'bg-purple-500/15 text-purple-300 border border-purple-500/30'
+                  : 'bg-sky-500/15 text-sky-300 border border-sky-500/30'
               }`}
             >
               <span
                 className={`w-1.5 h-1.5 rounded-full ${
-                  isRented ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'
+                  isRented
+                    ? 'bg-emerald-400 animate-pulse'
+                    : isListed
+                    ? 'bg-amber-400'
+                    : isNotOwned
+                    ? 'bg-purple-400'
+                    : 'bg-sky-400'
                 }`}
               />
-              {isRented ? 'В аренде' : 'Выставлен'}
+              {isRented ? 'В аренде' : isListed ? 'Выставлен' : isNotOwned ? 'Не во владении' : 'В кошельке'}
             </span>
 
             {/* Price badge */}
             <span className="text-[11px] text-slate-400">
-              {gift.priceTon} TON / {gift.durationDays}д
+              {isRented || isListed
+                ? `${gift.priceTon} TON / ${gift.durationDays}д`
+                : isInWallet
+                ? 'В личном кошельке'
+                : 'Продан или передан'}
             </span>
           </div>
 

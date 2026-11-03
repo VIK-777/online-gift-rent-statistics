@@ -240,6 +240,7 @@ export function App() {
         // Status filter
         if (statusFilter === 'rented' && g.status !== 'Rented') return false
         if (statusFilter === 'listed' && g.status !== 'Listed for Rent') return false
+        if (statusFilter === 'not_owned' && g.status !== 'Not Owned') return false
 
         // Search query
         if (searchQuery.trim()) {
@@ -323,6 +324,7 @@ export function App() {
               totalCount={data.gifts.length}
               rentedCount={data.summary.activeRentedCount}
               listedCount={data.summary.listedCount}
+              notOwnedCount={data.gifts.filter(g => g.status === 'Not Owned').length}
             />
 
             {/* Gifts list */}

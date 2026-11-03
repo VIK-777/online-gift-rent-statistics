@@ -20,7 +20,7 @@ export interface PersistentWalletState {
   nftAddressToNameMap: Record<string, string>
 }
 
-const STORAGE_PREFIX = 'ton_gift_rent_v4_'
+const STORAGE_PREFIX = 'ton_gift_rent_v5_'
 const WALLET_MAP_PREFIX = 'ton_gift_wallet_map_'
 
 export class RentalScanner {
@@ -205,15 +205,15 @@ export class RentalScanner {
     const returnedNfts = new Set<string>()
     let beforeLt: number | undefined = undefined
     let maxLt: number | null = lastScannedLt
-    const maxPages = lastScannedLt ? 2 : 5
+    const maxPages = 100 // Safe upper bound for full history
 
     for (let page = 1; page <= maxPages; page++) {
       onProgress({
         stage: 'scanning_events',
-        message: `Сканируем историю транзакций (страница ${page} из ${maxPages})...`,
+        message: `Сканируем историю транзакций (страница ${page})...`,
         current: page,
         total: maxPages,
-        percent: 5 + page * 5
+        percent: Math.min(30, 5 + page * 3)
       })
 
       const limit = (lastScannedLt && page === 1) ? 25 : 100
@@ -264,7 +264,7 @@ export class RentalScanner {
 
               if (
                 recipient === targetWallet &&
-                (comment.toLowerCase().includes('rent') || comment.toLowerCase().includes('marketapp.org')) &&
+                (comment.toLowerCase().includes('rent') || comment.toLowerCase().includes('marketapp')) &&
                 !comment.toLowerCase().includes('rent settings has been updated')
               ) {
                 const amountTon = (tt.amount || 0) / 1_000_000_000
@@ -380,9 +380,22 @@ export class RentalScanner {
                 updatedCachedGifts.push(freshDetail)
               }
             } else {
-              // NFT is no longer held in rental contract
+              // NFT is no longer held in rental contract: check if returned to wallet or transferred/sold
+              const nftItem = await this.client.getNft(expGift.nftAddress)
+              const currentOwner = nftItem?.owner?.address?.toLowerCase()
+              const status: 'Not Owned' | 'In Wallet' = (currentOwner && currentOwner === targetWallet) ? 'In Wallet' : 'Not Owned'
+              const updatedPastGift: GiftRentalDetail = {
+                ...expGift,
+                status,
+                rentStartedAtUtc: undefined,
+                rentExpiresAtUtc: undefined,
+                rentTimeRemainingSeconds: undefined,
+                renterAddress: undefined
+              }
               if (idx >= 0) {
-                updatedCachedGifts.splice(idx, 1)
+                updatedCachedGifts[idx] = updatedPastGift
+              } else {
+                updatedCachedGifts.push(updatedPastGift)
               }
             }
           } catch (err) {
@@ -579,20 +592,87 @@ export class RentalScanner {
     }
 
     // Attach history and earnings to active gifts
+    const activeGiftsByAddress = new Map<string, GiftRentalDetail>()
     for (const gift of activeGifts) {
       const history = payoutsByNft[gift.nftAddress.toLowerCase()] || []
       gift.history = history
       gift.totalEarnedTon = Math.round(history.reduce((sum, h) => sum + h.amountTon, 0) * 1000) / 1000
       gift.timesRented = Math.max(gift.status === 'Rented' ? 1 : 0, history.length)
+      activeGiftsByAddress.set(gift.nftAddress.toLowerCase(), gift)
     }
 
-    // Sort active gifts: first rented (closest to expiry), then listed
-    activeGifts.sort((a, b) => {
-      if (a.status === 'Rented' && b.status !== 'Rented') return -1
-      if (a.status !== 'Rented' && b.status === 'Rented') return 1
-      const remA = a.rentTimeRemainingSeconds ?? Number.MAX_SAFE_INTEGER
-      const remB = b.rentTimeRemainingSeconds ?? Number.MAX_SAFE_INTEGER
-      return remA - remB
+    const allGifts: GiftRentalDetail[] = [...activeGifts]
+    const cachedPastGiftsMap = new Map<string, GiftRentalDetail>()
+    if (existingState?.cachedGifts) {
+      for (const g of existingState.cachedGifts) {
+        cachedPastGiftsMap.set(g.nftAddress.toLowerCase(), g)
+      }
+    }
+
+    // Add past gifts for which payouts were received, but are not actively in rent
+    for (const [nftAddr, nftPayouts] of Object.entries(payoutsByNft)) {
+      if (!activeGiftsByAddress.has(nftAddr)) {
+        const prevCached = cachedPastGiftsMap.get(nftAddr)
+        if (prevCached && !forceRefresh) {
+          const totalEarned = Math.round(nftPayouts.reduce((sum, h) => sum + h.amountTon, 0) * 1000) / 1000
+          allGifts.push({
+            ...prevCached,
+            timesRented: nftPayouts.length,
+            totalEarnedTon: totalEarned,
+            history: nftPayouts
+          })
+        } else {
+          try {
+            const nftItem = nftMap.get(nftAddr) || await this.client.getNft(nftAddr)
+            const rawName = nftItem?.metadata?.name || nftAddressToNameMap[nftAddr] || nftPayouts[0]?.giftName || 'Gift'
+            const { collectionName, number } = BocParser.parseNameAndNumber(rawName)
+            const displayName = `${collectionName} #${number}`
+            nftAddressToNameMap[nftAddr] = displayName
+
+            const imageUrl = nftItem?.metadata?.image || nftItem?.previews?.[1]?.url || nftItem?.previews?.[0]?.url
+            const currentOwner = nftItem?.owner?.address?.toLowerCase()
+            const status: 'Not Owned' | 'In Wallet' = (currentOwner && currentOwner === targetWallet) ? 'In Wallet' : 'Not Owned'
+
+            const totalEarned = Math.round(nftPayouts.reduce((sum, h) => sum + h.amountTon, 0) * 1000) / 1000
+            allGifts.push({
+              name: displayName,
+              collectionName,
+              number,
+              imageUrl,
+              nftAddress: nftAddr,
+              status,
+              priceTon: 0,
+              durationDays: 0,
+              timesRented: nftPayouts.length,
+              totalEarnedTon: totalEarned,
+              history: nftPayouts,
+              url: `https://tonviewer.com/${nftAddr}`
+            })
+          } catch (err) {
+            console.warn(`[RentalScanner] Failed to fetch past gift metadata for ${nftAddr}:`, err)
+          }
+        }
+      }
+    }
+
+    // Sort all gifts: Rented (closest to expiry), then Listed for Rent, then In Wallet, then Not Owned (by earned)
+    allGifts.sort((a, b) => {
+      const getPriority = (status: string) => {
+        if (status === 'Rented') return 0
+        if (status === 'Listed for Rent') return 1
+        if (status === 'In Wallet') return 2
+        return 3
+      }
+      const prioA = getPriority(a.status)
+      const prioB = getPriority(b.status)
+      if (prioA !== prioB) return prioA - prioB
+
+      if (a.status === 'Rented') {
+        const remA = a.rentTimeRemainingSeconds ?? Number.MAX_SAFE_INTEGER
+        const remB = b.rentTimeRemainingSeconds ?? Number.MAX_SAFE_INTEGER
+        return remA - remB
+      }
+      return b.totalEarnedTon - a.totalEarnedTon
     })
 
     // Save updated state to localStorage
@@ -602,7 +682,7 @@ export class RentalScanner {
       lastScannedLt: maxLt || existingState?.lastScannedLt || null,
       lastScannedTimestamp: nowSeconds,
       payouts: allPayouts,
-      cachedGifts: activeGifts,
+      cachedGifts: allGifts,
       candidateNfts: Array.from(candidateNfts),
       contractToNftMap,
       nftAddressToNameMap

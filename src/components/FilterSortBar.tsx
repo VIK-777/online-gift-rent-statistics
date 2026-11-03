@@ -1,7 +1,7 @@
 import React from 'react'
 import { ArrowUpDown, Search } from 'lucide-react'
 
-export type FilterStatus = 'all' | 'rented' | 'listed'
+export type FilterStatus = 'all' | 'rented' | 'listed' | 'not_owned'
 export type SortField = 'expiry' | 'earned' | 'price' | 'name'
 
 interface FilterSortBarProps {
@@ -14,6 +14,7 @@ interface FilterSortBarProps {
   totalCount: number
   rentedCount: number
   listedCount: number
+  notOwnedCount?: number
 }
 
 export const FilterSortBar: React.FC<FilterSortBarProps> = ({
@@ -25,7 +26,8 @@ export const FilterSortBar: React.FC<FilterSortBarProps> = ({
   onSearchChange,
   totalCount,
   rentedCount,
-  listedCount
+  listedCount,
+  notOwnedCount = 0
 }) => {
   return (
     <div className="w-full max-w-2xl mx-auto px-4 py-2 space-y-2">
@@ -41,9 +43,9 @@ export const FilterSortBar: React.FC<FilterSortBarProps> = ({
         />
       </div>
 
-      <div className="flex items-center justify-between gap-2 text-xs">
+      <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
         {/* Status Tabs */}
-        <div className="flex items-center p-1 rounded-xl bg-slate-900/80 border border-slate-800/80">
+        <div className="flex flex-wrap items-center p-1 rounded-xl bg-slate-900/80 border border-slate-800/80 gap-1">
           <button
             onClick={() => onStatusChange('all')}
             className={`px-2.5 py-1 rounded-lg font-medium transition ${
@@ -74,6 +76,18 @@ export const FilterSortBar: React.FC<FilterSortBarProps> = ({
           >
             Выставлены ({listedCount})
           </button>
+          {notOwnedCount > 0 && (
+            <button
+              onClick={() => onStatusChange('not_owned')}
+              className={`px-2.5 py-1 rounded-lg font-medium transition ${
+                statusFilter === 'not_owned'
+                  ? 'bg-purple-500 text-white shadow-sm'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              Не у меня ({notOwnedCount})
+            </button>
+          )}
         </div>
 
         {/* Sort Select */}

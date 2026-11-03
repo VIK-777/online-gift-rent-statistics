@@ -18,7 +18,7 @@ export interface GiftRentalDetail {
   number: number
   imageUrl?: string
   nftAddress: string
-  status: 'Rented' | 'Listed for Rent'
+  status: 'Rented' | 'Listed for Rent' | 'Not Owned' | 'In Wallet'
   priceTon: number
   durationDays: number
   rentStartedAtUtc?: string
