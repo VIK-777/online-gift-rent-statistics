@@ -20,7 +20,7 @@ export interface PersistentWalletState {
   nftAddressToNameMap: Record<string, string>
 }
 
-const STORAGE_PREFIX = 'ton_gift_rent_v5_'
+const STORAGE_PREFIX = 'ton_gift_rent_v6_'
 const WALLET_MAP_PREFIX = 'ton_gift_wallet_map_'
 
 export class RentalScanner {
@@ -193,9 +193,21 @@ export class RentalScanner {
     const nftAddressToNameMap = (!forceRefresh && existingState) ? { ...(existingState.nftAddressToNameMap || {}) } : {}
     const allPayoutsMap = new Map<string, RentalPayout>()
 
-    if (!forceRefresh && existingState && existingState.payouts) {
+    if (existingState && existingState.payouts) {
       for (const p of existingState.payouts) {
-        allPayoutsMap.set(p.eventId, p)
+        if (!forceRefresh) {
+          allPayoutsMap.set(p.eventId, p)
+        }
+        if (p.nftAddress) {
+          candidateNfts.add(p.nftAddress.toLowerCase())
+        }
+      }
+    }
+    if (existingState && existingState.cachedGifts) {
+      for (const g of existingState.cachedGifts) {
+        if (g.nftAddress) {
+          candidateNfts.add(g.nftAddress.toLowerCase())
+        }
       }
     }
 
@@ -428,11 +440,11 @@ export class RentalScanner {
     for (const c of newCandidates) {
       candidateNfts.add(c)
     }
-    for (const ret of returnedNfts) {
-      candidateNfts.delete(ret)
-    }
     for (const p of newPayouts) {
       allPayoutsMap.set(p.eventId, p)
+      if (p.nftAddress) {
+        candidateNfts.add(p.nftAddress.toLowerCase())
+      }
     }
 
     // Resolve contract to NFT for all payouts with unknown NFT (deduplicating unique senders)
@@ -530,7 +542,7 @@ export class RentalScanner {
     const activeCandidates = allCandidatesList.filter(nftAddr => {
       const nft = nftMap.get(nftAddr.toLowerCase())
       if (!nft || !nft.owner?.address) return true // Inspect if bulk didn't return owner
-      return nft.owner.address.toLowerCase() !== targetWallet
+      return nft.owner.address.toLowerCase() !== targetWallet && !nft.owner.is_wallet
     })
 
     const totalCandidates = activeCandidates.length
@@ -613,11 +625,11 @@ export class RentalScanner {
     for (const [nftAddr, nftPayouts] of Object.entries(payoutsByNft)) {
       if (!activeGiftsByAddress.has(nftAddr)) {
         const prevCached = cachedPastGiftsMap.get(nftAddr)
-        if (prevCached && !forceRefresh) {
+        if (prevCached && !forceRefresh && prevCached.status === 'In Wallet') {
           const totalEarned = Math.round(nftPayouts.reduce((sum, h) => sum + h.amountTon, 0) * 1000) / 1000
           allGifts.push({
             ...prevCached,
-            timesRented: nftPayouts.length,
+            timesRented: Math.max(prevCached.timesRented, nftPayouts.length),
             totalEarnedTon: totalEarned,
             history: nftPayouts
           })
@@ -631,23 +643,45 @@ export class RentalScanner {
 
             const imageUrl = nftItem?.metadata?.image || nftItem?.previews?.[1]?.url || nftItem?.previews?.[0]?.url
             const currentOwner = nftItem?.owner?.address?.toLowerCase()
-            const status: 'Not Owned' | 'In Wallet' = (currentOwner && currentOwner === targetWallet) ? 'In Wallet' : 'Not Owned'
+            const isWallet = nftItem?.owner?.is_wallet ?? false
+
+            // Resilient fallback: if owner is a smart contract (not personal wallet), inspect rental!
+            let activeRental: GiftRentalDetail | null = null
+            if (currentOwner && currentOwner !== targetWallet && !isWallet) {
+              activeRental = await this.inspectNftRental(
+                nftAddr,
+                targetWallet,
+                nowSeconds,
+                contractToNftMap,
+                nftItem || undefined
+              )
+            }
 
             const totalEarned = Math.round(nftPayouts.reduce((sum, h) => sum + h.amountTon, 0) * 1000) / 1000
-            allGifts.push({
-              name: displayName,
-              collectionName,
-              number,
-              imageUrl,
-              nftAddress: nftAddr,
-              status,
-              priceTon: 0,
-              durationDays: 0,
-              timesRented: nftPayouts.length,
-              totalEarnedTon: totalEarned,
-              history: nftPayouts,
-              url: `https://tonviewer.com/${nftAddr}`
-            })
+
+            if (activeRental) {
+              activeRental.history = nftPayouts
+              activeRental.totalEarnedTon = totalEarned
+              activeRental.timesRented = Math.max(activeRental.timesRented, nftPayouts.length)
+              allGifts.push(activeRental)
+              activeGiftsByAddress.set(nftAddr, activeRental)
+            } else {
+              const status: 'Not Owned' | 'In Wallet' = (currentOwner && currentOwner === targetWallet) ? 'In Wallet' : 'Not Owned'
+              allGifts.push({
+                name: displayName,
+                collectionName,
+                number,
+                imageUrl,
+                nftAddress: nftAddr,
+                status,
+                priceTon: 0,
+                durationDays: 0,
+                timesRented: nftPayouts.length,
+                totalEarnedTon: totalEarned,
+                history: nftPayouts,
+                url: `https://tonviewer.com/${nftAddr}`
+              })
+            }
           } catch (err) {
             console.warn(`[RentalScanner] Failed to fetch past gift metadata for ${nftAddr}:`, err)
           }
@@ -715,8 +749,8 @@ export class RentalScanner {
 
     const currentOwner = nft.owner.address.toLowerCase()
 
-    // If held directly in wallet, it's NOT in rent
-    if (currentOwner === targetWallet) {
+    // If held directly in wallet or personal wallet, it's NOT in a rental contract
+    if (currentOwner === targetWallet || nft.owner.is_wallet) {
       return null
     }
 
@@ -744,6 +778,9 @@ export class RentalScanner {
           const expireTimestamp = isRented ? startTime + durationSeconds : 0
           const remainingSeconds = isRented && expireTimestamp > 0 ? Math.max(0, expireTimestamp - nowSeconds) : undefined
 
+          const renterHex = getParams.stack[5]?.num || '0x0'
+          const renterAddress = (isRented && renterHex !== '0x0' && renterHex !== '0' && renterHex.length > 10) ? renterHex : undefined
+
           return {
             name: displayName,
             collectionName,
@@ -758,6 +795,7 @@ export class RentalScanner {
             rentTimeRemainingSeconds: remainingSeconds,
             timesRented: isRented ? 1 : 0,
             totalEarnedTon: 0,
+            renterAddress,
             history: [],
             url: `https://tonviewer.com/${nftAddress}`
           }

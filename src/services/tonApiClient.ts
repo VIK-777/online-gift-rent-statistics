@@ -44,7 +44,7 @@ export interface TonEventsResponse {
 export interface TonNftItem {
   address: string
   index: number
-  owner?: { address: string; name?: string }
+  owner?: { address: string; name?: string; is_wallet?: boolean }
   collection?: { address: string; name?: string }
   metadata?: {
     name?: string
