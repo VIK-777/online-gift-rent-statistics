@@ -282,19 +282,39 @@ export class RentalScanner {
                 const amountTon = (tt.amount || 0) / 1_000_000_000
                 const dateStr = new Date(ev.timestamp * 1000).toUTCString()
 
-                // Extract real renter wallet from SmartContractExec in this event
+                // Extract real renter wallet from SmartContractExec in this event (or via full event fetch)
                 let renterWallet: string | undefined = undefined
                 if (ev.actions) {
                   for (const a of ev.actions) {
                     if (a.type === 'SmartContractExec' && a.SmartContractExec) {
                       const ex = a.SmartContractExec.executor
                       const exAddr = ex?.address?.toLowerCase()
-                      const isWallet = (ex as any)?.is_wallet ?? false
+                      const isWallet = ex?.is_wallet ?? false
                       if (exAddr && exAddr !== targetWallet && exAddr !== sender && isWallet) {
                         renterWallet = exAddr
                         break
                       }
                     }
+                  }
+                }
+                if (!renterWallet && ev.event_id) {
+                  try {
+                    const fullEv = await this.client.getEvent(ev.event_id)
+                    if (fullEv?.actions) {
+                      for (const a of fullEv.actions) {
+                        if (a.type === 'SmartContractExec' && a.SmartContractExec) {
+                          const ex = a.SmartContractExec.executor
+                          const exAddr = ex?.address?.toLowerCase()
+                          const isWallet = ex?.is_wallet ?? false
+                          if (exAddr && exAddr !== targetWallet && exAddr !== sender && isWallet) {
+                            renterWallet = exAddr
+                            break
+                          }
+                        }
+                      }
+                    }
+                  } catch {
+                    // Ignore single event lookup error
                   }
                 }
 
@@ -328,9 +348,14 @@ export class RentalScanner {
       return expEpoch > 0 && nowSeconds >= expEpoch
     })
 
+    const hasUnresolvedRenters = Boolean(existingState && (
+      existingState.payouts.some(p => !p.renterAddress) ||
+      existingState.cachedGifts.some(g => g.status === 'Rented' && (!g.renterAddress || g.renterAddress === 'None' || g.renterAddress.startsWith('0x')))
+    ))
+
     // Fast-path 2 (Kotlin parity):
-    // If state exists, forceRefresh is false, and no new rental payouts/transfers occurred
-    if (!forceRefresh && existingState && !hasNewTransactions) {
+    // If state exists, forceRefresh is false, no new rental payouts/transfers occurred, and no legacy unresolved renters
+    if (!forceRefresh && existingState && !hasNewTransactions && !hasUnresolvedRenters) {
       if (expiredRentedGifts.length === 0) {
         // Case A: No new transactions AND no gift rentals have expired!
         // No need to inspect ANY contracts on-chain.
@@ -506,10 +531,30 @@ export class RentalScanner {
       }
     }
 
-    // Now map all payouts to resolved NFT addresses
+    // Now map all payouts to resolved NFT addresses and resolve missing renterAddress
     for (const payout of allPayoutsList) {
       if (!payout.nftAddress && payout.senderAddress && contractToNftMap[payout.senderAddress]) {
         payout.nftAddress = contractToNftMap[payout.senderAddress]
+      }
+      if (!payout.renterAddress && payout.eventId) {
+        try {
+          const fullEv = await this.client.getEvent(payout.eventId)
+          if (fullEv?.actions) {
+            for (const a of fullEv.actions) {
+              if (a.type === 'SmartContractExec' && a.SmartContractExec) {
+                const ex = a.SmartContractExec.executor
+                const exAddr = ex?.address?.toLowerCase()
+                const isWallet = ex?.is_wallet ?? false
+                if (exAddr && exAddr !== targetWallet && exAddr !== payout.senderAddress?.toLowerCase() && isWallet) {
+                  payout.renterAddress = exAddr
+                  break
+                }
+              }
+            }
+          }
+        } catch {
+          // Ignore
+        }
       }
     }
 
@@ -544,39 +589,84 @@ export class RentalScanner {
       if (!nft || !nft.owner?.address) return true // Inspect if bulk didn't return owner
       return nft.owner.address.toLowerCase() !== targetWallet && !nft.owner.is_wallet
     })
-
     const totalCandidates = activeCandidates.length
+
+    // Optimize: identify gifts that are already known to be actively rented with future expiration.
+    // While rent has not expired, the NFT is locked in the smart contract and its state cannot change.
+    const cachedActiveRentedMap = new Map<string, GiftRentalDetail>()
+    if (existingState?.cachedGifts) {
+      for (const g of existingState.cachedGifts) {
+        if (
+          g.status === 'Rented' &&
+          g.rentExpiresAtUtc &&
+          !g.rentExpiresAtUtc.includes('1970') &&
+          g.renterAddress &&
+          g.renterAddress !== 'None' &&
+          !g.renterAddress.startsWith('0x')
+        ) {
+          const expEpoch = Math.floor(new Date(g.rentExpiresAtUtc).getTime() / 1000)
+          if (expEpoch > nowSeconds) {
+            cachedActiveRentedMap.set(g.nftAddress.toLowerCase(), g)
+          }
+        }
+      }
+    }
+
     const activeGifts: GiftRentalDetail[] = []
 
-    let candidateIdx = 0
+    // 2.1 Fast-track actively rented gifts (no on-chain contract polling needed)
+    const candidatesToInspectOnChain: string[] = []
     for (const nftAddr of activeCandidates) {
-      candidateIdx++
-      const pct = 40 + Math.floor((candidateIdx / Math.max(1, totalCandidates)) * 50)
-      const cachedNft = nftMap.get(nftAddr.toLowerCase())
-      const giftLabel = cachedNft?.metadata?.name || `Подарок #${candidateIdx}`
-
-      onProgress({
-        stage: 'inspecting_contracts',
-        message: `Проверяем аренду: ${giftLabel} (${candidateIdx}/${totalCandidates})...`,
-        current: candidateIdx,
-        total: totalCandidates,
-        percent: pct
-      })
-
-      try {
-        const giftDetail = await this.inspectNftRental(
-          nftAddr,
-          targetWallet,
-          nowSeconds,
-          contractToNftMap,
-          cachedNft
-        )
-        if (giftDetail) {
-          activeGifts.push(giftDetail)
-          nftAddressToNameMap[nftAddr.toLowerCase()] = giftDetail.name
+      const lower = nftAddr.toLowerCase()
+      if (cachedActiveRentedMap.has(lower) && !returnedNfts.has(lower)) {
+        const cachedGift = cachedActiveRentedMap.get(lower)!
+        const expEpoch = Math.floor(new Date(cachedGift.rentExpiresAtUtc!).getTime() / 1000)
+        const remainingSeconds = Math.max(0, expEpoch - nowSeconds)
+        activeGifts.push({
+          ...cachedGift,
+          rentTimeRemainingSeconds: remainingSeconds
+        })
+        if (cachedGift.name) {
+          nftAddressToNameMap[lower] = cachedGift.name
         }
-      } catch (err) {
-        console.warn(`[RentalScanner] Error inspecting NFT ${nftAddr}:`, err)
+      } else {
+        candidatesToInspectOnChain.push(nftAddr)
+      }
+    }
+
+    const totalToInspect = candidatesToInspectOnChain.length
+    let candidateIdx = 0
+
+    if (totalToInspect > 0) {
+      for (const nftAddr of candidatesToInspectOnChain) {
+        candidateIdx++
+        const pct = 40 + Math.floor((candidateIdx / Math.max(1, totalToInspect)) * 50)
+        const cachedNft = nftMap.get(nftAddr.toLowerCase())
+        const giftLabel = cachedNft?.metadata?.name || `Подарок #${candidateIdx}`
+
+        onProgress({
+          stage: 'inspecting_contracts',
+          message: `Проверяем аренду: ${giftLabel} (${candidateIdx}/${totalToInspect})...`,
+          current: candidateIdx,
+          total: totalToInspect,
+          percent: pct
+        })
+
+        try {
+          const giftDetail = await this.inspectNftRental(
+            nftAddr,
+            targetWallet,
+            nowSeconds,
+            contractToNftMap,
+            cachedNft
+          )
+          if (giftDetail) {
+            activeGifts.push(giftDetail)
+            nftAddressToNameMap[nftAddr.toLowerCase()] = giftDetail.name
+          }
+        } catch (err) {
+          console.warn(`[RentalScanner] Error inspecting NFT ${nftAddr}:`, err)
+        }
       }
     }
 
@@ -778,8 +868,12 @@ export class RentalScanner {
           const expireTimestamp = isRented ? startTime + durationSeconds : 0
           const remainingSeconds = isRented && expireTimestamp > 0 ? Math.max(0, expireTimestamp - nowSeconds) : undefined
 
-          const renterHex = getParams.stack[5]?.num || '0x0'
-          const renterAddress = (isRented && renterHex !== '0x0' && renterHex !== '0' && renterHex.length > 10) ? renterHex : undefined
+          const rawRenterHex = getParams.stack[5]?.num || '0x0'
+          let renterAddress: string | undefined = undefined
+          if (isRented && rawRenterHex !== '0x0' && rawRenterHex !== '0' && rawRenterHex.length > 10) {
+            const cleanHex = rawRenterHex.toLowerCase().replace('0x', '').padStart(64, '0')
+            renterAddress = `0:${cleanHex}`
+          }
 
           return {
             name: displayName,

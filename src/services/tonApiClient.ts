@@ -24,7 +24,7 @@ export interface TonEventAction {
   }
   SmartContractExec?: {
     operation?: string
-    executor?: { address: string }
+    executor?: { address: string; name?: string; is_wallet?: boolean }
     contract?: { address: string }
   }
 }
@@ -212,6 +212,15 @@ export class TonApiClient {
       params.append('before_lt', beforeLt.toString())
     }
     return this.request<TonEventsResponse>(`/accounts/${encodeURIComponent(address)}/events?${params.toString()}`)
+  }
+
+  /**
+   * Fetches full event details by event_id.
+   * Unlike /accounts/{address}/events which only includes actions involving that account,
+   * /events/{eventId} includes all actions (e.g. SmartContractExec from the user who triggered the rental).
+   */
+  async getEvent(eventId: string): Promise<TonAccountEvent | null> {
+    return this.request<TonAccountEvent>(`/events/${encodeURIComponent(eventId)}`)
   }
 
   /**

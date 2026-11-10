@@ -52,26 +52,33 @@ export class BocParser {
 
       const startTime = this.readUint32(c1Bits, 833)
 
-      // Cell 2: isListed flag (bit 0), expireTime (bit 67..99), renter (bit 135..402), linkedContract (bit 402..669)
+      // Cell 2: isListed flag (bit 0), expireTime (bit 67..99), renter (candidate offsets), linkedContract
       const c2Bits = this.toBits(cells[2].data)
       const isListedBit = c2Bits.length > 0 && c2Bits[0] === '1'
       const expireTime = c2Bits.length >= 99 ? this.readUint32(c2Bits, 67) : 0
 
       let renterAddr: string | null = null
-      if (c2Bits.length >= 135 + 267) {
-        const renterRes = this.readAddress(c2Bits, 135)
-        renterAddr = renterRes ? renterRes.address : null
+      let linkedContract: string | null = null
+      const candidateOffsets = [135, 127, 119, 143, 151]
+      for (const pos of candidateOffsets) {
+        if (c2Bits.length >= pos + 267) {
+          const renterRes = this.readAddress(c2Bits, pos)
+          if (renterRes && renterRes.address !== 'None' && !renterRes.address.startsWith('-')) {
+            renterAddr = renterRes.address
+            if (c2Bits.length >= pos + 267 + 267) {
+              const linkedRes = this.readAddress(c2Bits, pos + 267)
+              if (linkedRes && linkedRes.address !== 'None' && !linkedRes.address.startsWith('-')) {
+                linkedContract = linkedRes.address
+              }
+            }
+            break
+          }
+        }
       }
 
       // A gift is actively rented ONLY if it is not relisted, has a non-zero expireTime, and has an assigned renter
       const isRented = !isListedBit && expireTime > 0 && renterAddr !== null
       const status: 'Rented' | 'Listed for Rent' = isRented ? 'Rented' : 'Listed for Rent'
-
-      let linkedContract: string | null = null
-      if (c2Bits.length >= 402 + 267) {
-        const linkedRes = this.readAddress(c2Bits, 402)
-        linkedContract = linkedRes ? linkedRes.address : null
-      }
 
       // Cell 3: minDuration (bit 1..33), maxDuration (bit 33..65), priceNano (bit 65..)
       const c3Bits = this.toBits(cells[3].data)
