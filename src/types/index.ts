@@ -5,6 +5,7 @@ export interface RentalPayout {
   amountTon: number
   senderAddress: string
   renterAddress?: string
+  renterResolved?: boolean
   durationDays?: number
   comment: string
   nftAddress?: string

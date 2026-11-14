@@ -8,7 +8,7 @@ import { ProgressIndicator } from './components/ProgressIndicator'
 import { RentalHistoryModal } from './components/RentalHistoryModal'
 import { SettingsModal } from './components/SettingsModal'
 import { TonApiClient } from './services/tonApiClient'
-import { RentalScanner } from './services/rentalScanner'
+import { RentalScanner, STORAGE_PREFIX, WALLET_MAP_PREFIX } from './services/rentalScanner'
 import {
   RentalDashboardResponse,
   ScanProgress,
@@ -208,18 +208,18 @@ export function App() {
   const handleClearCache = () => {
     if (currentWallet) {
       const clean = currentWallet.toLowerCase()
-      localStorage.removeItem(`ton_gift_rent_v4_${clean}`)
-      const mapped = localStorage.getItem(`ton_gift_wallet_map_${clean}`)
+      localStorage.removeItem(`${STORAGE_PREFIX}${clean}`)
+      const mapped = localStorage.getItem(`${WALLET_MAP_PREFIX}${clean}`)
       if (mapped) {
-        localStorage.removeItem(`ton_gift_rent_v4_${mapped.toLowerCase()}`)
-        localStorage.removeItem(`ton_gift_wallet_map_${clean}`)
+        localStorage.removeItem(`${STORAGE_PREFIX}${mapped.toLowerCase()}`)
+        localStorage.removeItem(`${WALLET_MAP_PREFIX}${clean}`)
       }
     }
     try {
       const keysToRemove: string[] = []
       for (let i = 0; i < localStorage.length; i++) {
         const k = localStorage.key(i)
-        if (k && (k.startsWith('ton_gift_rent_') || k.startsWith('ton_gift_wallet_map_'))) {
+        if (k && (k.startsWith('ton_gift_rent_') || k.startsWith(WALLET_MAP_PREFIX))) {
           keysToRemove.push(k)
         }
       }

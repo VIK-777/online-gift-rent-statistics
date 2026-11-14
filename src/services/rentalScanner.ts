@@ -13,21 +13,38 @@ export interface PersistentWalletState {
   friendlyAddress?: string
   lastScannedLt: number | null
   lastScannedTimestamp: number
+  fullHistoryScanned?: boolean
   payouts: RentalPayout[]
   cachedGifts: GiftRentalDetail[]
   candidateNfts: string[]
   contractToNftMap: Record<string, string>
   nftAddressToNameMap: Record<string, string>
+  nonRentalContracts?: string[]
 }
 
-const STORAGE_PREFIX = 'ton_gift_rent_v6_'
-const WALLET_MAP_PREFIX = 'ton_gift_wallet_map_'
+export const STORAGE_PREFIX = 'ton_gift_rent_v6_'
+export const WALLET_MAP_PREFIX = 'ton_gift_wallet_map_'
+
+const ZERO_ADDRESS = '0:0000000000000000000000000000000000000000000000000000000000000000'
+const KNOWN_NON_RENTAL_ROUTERS = new Set<string>([
+  '0:fc5f9be1eb3ef6efce2fc6e7a7bbdb7ab5f5c31e24715fd2dc14b27fa19c0191',
+  ZERO_ADDRESS,
+  'none'
+])
+const EXPIRED_RECHECK_COOLDOWN_SECONDS = 300
+const RENT_COMMENT_REGEX = /\brent(al|ed)?\b/i
 
 export class RentalScanner {
   private client: TonApiClient
 
   constructor(client: TonApiClient) {
     this.client = client
+  }
+
+  private isValidContractAddress(addr?: string | null): boolean {
+    if (!addr) return false
+    const clean = addr.trim().toLowerCase()
+    return clean.length > 0 && !KNOWN_NON_RENTAL_ROUTERS.has(clean)
   }
 
   /**
@@ -189,7 +206,17 @@ export class RentalScanner {
 
     const lastScannedLt = (!forceRefresh && existingState) ? existingState.lastScannedLt : null
     const candidateNfts = new Set<string>((!forceRefresh && existingState) ? existingState.candidateNfts : [])
-    const contractToNftMap = (!forceRefresh && existingState) ? { ...(existingState.contractToNftMap || {}) } : {}
+    const contractToNftMap: Record<string, string> = {}
+    if (!forceRefresh && existingState?.contractToNftMap) {
+      for (const [k, v] of Object.entries(existingState.contractToNftMap)) {
+        if (this.isValidContractAddress(k)) {
+          contractToNftMap[k.toLowerCase()] = v.toLowerCase()
+        }
+      }
+    }
+    const nonRentalContracts = new Set<string>(
+      (!forceRefresh && existingState?.nonRentalContracts) ? existingState.nonRentalContracts.map(c => c.toLowerCase()) : []
+    )
     const nftAddressToNameMap = (!forceRefresh && existingState) ? { ...(existingState.nftAddressToNameMap || {}) } : {}
     const allPayoutsMap = new Map<string, RentalPayout>()
 
@@ -218,6 +245,8 @@ export class RentalScanner {
     let beforeLt: number | undefined = undefined
     let maxLt: number | null = lastScannedLt
     const maxPages = 100 // Safe upper bound for full history
+    let reachedOld = false
+    let completedFullScan = false
 
     for (let page = 1; page <= maxPages; page++) {
       onProgress({
@@ -230,9 +259,15 @@ export class RentalScanner {
 
       const limit = (lastScannedLt && page === 1) ? 25 : 100
       const eventsRes = await this.client.getAccountEvents(targetWallet, limit, beforeLt)
-      if (!eventsRes || !eventsRes.events || eventsRes.events.length === 0) break
+      if (!eventsRes) {
+        // Network error mid-scan: do not mark scan complete so lastScannedLt won't skip unscanned pages
+        break
+      }
+      if (!eventsRes.events || eventsRes.events.length === 0) {
+        completedFullScan = true
+        break
+      }
 
-      let reachedOld = false
       for (const ev of eventsRes.events) {
         const evLt = ev.lt
         if (lastScannedLt && evLt <= lastScannedLt) {
@@ -257,12 +292,25 @@ export class RentalScanner {
               if (nftAddr) {
                 if (sender === targetWallet) {
                   newCandidates.add(nftAddr)
-                  if (recipient) {
-                    contractToNftMap[recipient] = nftAddr
+                  if (this.isValidContractAddress(recipient)) {
+                    contractToNftMap[recipient!] = nftAddr
                   }
+                } else if (
+                  sender &&
+                  KNOWN_NON_RENTAL_ROUTERS.has(sender) &&
+                  recipient &&
+                  recipient !== targetWallet &&
+                  this.isValidContractAddress(recipient)
+                ) {
+                  // 2nd hop of MarketApp transfer: router forwards NFT to the per-gift escrow contract
+                  newCandidates.add(nftAddr)
+                  contractToNftMap[recipient] = nftAddr
                 }
                 if (recipient === targetWallet) {
                   returnedNfts.add(nftAddr)
+                  if (this.isValidContractAddress(sender)) {
+                    contractToNftMap[sender!] = nftAddr
+                  }
                 }
               }
             }
@@ -271,18 +319,21 @@ export class RentalScanner {
             if (act.type === 'TonTransfer' && act.TonTransfer) {
               const tt = act.TonTransfer
               const comment = tt.comment || ''
+              const commentLower = comment.toLowerCase()
               const recipient = tt.recipient?.address?.toLowerCase()
               const sender = tt.sender?.address?.toLowerCase() || ''
+              const senderIsWallet = tt.sender?.is_wallet ?? false
 
               if (
                 recipient === targetWallet &&
-                (comment.toLowerCase().includes('rent') || comment.toLowerCase().includes('marketapp')) &&
-                !comment.toLowerCase().includes('rent settings has been updated')
+                !senderIsWallet &&
+                (RENT_COMMENT_REGEX.test(comment) || commentLower.includes('marketapp')) &&
+                !commentLower.includes('rent settings has been updated')
               ) {
                 const amountTon = (tt.amount || 0) / 1_000_000_000
                 const dateStr = new Date(ev.timestamp * 1000).toUTCString()
 
-                // Extract real renter wallet from SmartContractExec in this event (or via full event fetch)
+                // Extract real renter wallet from SmartContractExec in this event
                 let renterWallet: string | undefined = undefined
                 if (ev.actions) {
                   for (const a of ev.actions) {
@@ -297,26 +348,6 @@ export class RentalScanner {
                     }
                   }
                 }
-                if (!renterWallet && ev.event_id) {
-                  try {
-                    const fullEv = await this.client.getEvent(ev.event_id)
-                    if (fullEv?.actions) {
-                      for (const a of fullEv.actions) {
-                        if (a.type === 'SmartContractExec' && a.SmartContractExec) {
-                          const ex = a.SmartContractExec.executor
-                          const exAddr = ex?.address?.toLowerCase()
-                          const isWallet = ex?.is_wallet ?? false
-                          if (exAddr && exAddr !== targetWallet && exAddr !== sender && isWallet) {
-                            renterWallet = exAddr
-                            break
-                          }
-                        }
-                      }
-                    }
-                  } catch {
-                    // Ignore single event lookup error
-                  }
-                }
 
                 newPayouts.push({
                   eventId: ev.event_id,
@@ -325,6 +356,7 @@ export class RentalScanner {
                   amountTon: Math.round(amountTon * 1000) / 1000,
                   senderAddress: sender,
                   renterAddress: renterWallet,
+                  renterResolved: Boolean(renterWallet),
                   comment,
                   explorerUrl: `https://tonviewer.com/transaction/${ev.event_id}`
                 })
@@ -335,21 +367,35 @@ export class RentalScanner {
       }
 
       if (reachedOld) break
-      if (!eventsRes.next_from || eventsRes.next_from === beforeLt) break
+      if (!eventsRes.next_from || eventsRes.next_from === beforeLt) {
+        completedFullScan = true
+        break
+      }
       beforeLt = eventsRes.next_from
     }
 
+    const scanComplete = reachedOld || completedFullScan
+    const effectiveLastScannedLt = scanComplete
+      ? (maxLt || existingState?.lastScannedLt || null)
+      : (existingState?.lastScannedLt || null)
+    const effectiveFullHistoryScanned = Boolean(existingState?.fullHistoryScanned || completedFullScan)
+
     const hasNewTransactions = newPayouts.length > 0 || newCandidates.size > 0 || returnedNfts.size > 0
 
-    // Find any rented gifts in cache whose rental period has expired
+    // Find any rented gifts in cache whose rental period has expired (with 5-min cooldown for already-checked expired gifts)
+    const recentlyChecked = existingState ? (nowSeconds - existingState.lastScannedTimestamp) < EXPIRED_RECHECK_COOLDOWN_SECONDS : false
     const expiredRentedGifts = (existingState?.cachedGifts || []).filter(gift => {
       if (gift.status !== 'Rented' || !gift.rentExpiresAtUtc) return false
       const expEpoch = Math.floor(new Date(gift.rentExpiresAtUtc).getTime() / 1000)
-      return expEpoch > 0 && nowSeconds >= expEpoch
+      if (expEpoch <= 0 || nowSeconds < expEpoch) return false
+      if (existingState && expEpoch < existingState.lastScannedTimestamp && recentlyChecked) {
+        return false
+      }
+      return true
     })
 
     const hasUnresolvedRenters = Boolean(existingState && (
-      existingState.payouts.some(p => !p.renterAddress) ||
+      existingState.payouts.some(p => !p.renterAddress && !p.renterResolved) ||
       existingState.cachedGifts.some(g => g.status === 'Rented' && (!g.renterAddress || g.renterAddress === 'None' || g.renterAddress.startsWith('0x')))
     ))
 
@@ -362,8 +408,10 @@ export class RentalScanner {
         const updatedState: PersistentWalletState = {
           ...existingState,
           friendlyAddress: friendlyAddress || existingState.friendlyAddress,
-          lastScannedLt: maxLt || existingState.lastScannedLt,
-          lastScannedTimestamp: nowSeconds
+          lastScannedLt: effectiveLastScannedLt,
+          lastScannedTimestamp: nowSeconds,
+          fullHistoryScanned: effectiveFullHistoryScanned,
+          nonRentalContracts: Array.from(nonRentalContracts)
         }
         this.saveState(updatedState)
 
@@ -403,7 +451,8 @@ export class RentalScanner {
               expGift.nftAddress,
               targetWallet,
               nowSeconds,
-              contractToNftMap
+              contractToNftMap,
+              nonRentalContracts
             )
 
             const idx = updatedCachedGifts.findIndex(g => g.nftAddress.toLowerCase() === expGift.nftAddress.toLowerCase())
@@ -420,19 +469,22 @@ export class RentalScanner {
               // NFT is no longer held in rental contract: check if returned to wallet or transferred/sold
               const nftItem = await this.client.getNft(expGift.nftAddress)
               const currentOwner = nftItem?.owner?.address?.toLowerCase()
-              const status: 'Not Owned' | 'In Wallet' = (currentOwner && currentOwner === targetWallet) ? 'In Wallet' : 'Not Owned'
-              const updatedPastGift: GiftRentalDetail = {
-                ...expGift,
-                status,
-                rentStartedAtUtc: undefined,
-                rentExpiresAtUtc: undefined,
-                rentTimeRemainingSeconds: undefined,
-                renterAddress: undefined
-              }
-              if (idx >= 0) {
-                updatedCachedGifts[idx] = updatedPastGift
-              } else {
-                updatedCachedGifts.push(updatedPastGift)
+              // Only overwrite status if getNft succeeded with a valid owner address
+              if (currentOwner) {
+                const status: 'Not Owned' | 'In Wallet' = currentOwner === targetWallet ? 'In Wallet' : 'Not Owned'
+                const updatedPastGift: GiftRentalDetail = {
+                  ...expGift,
+                  status,
+                  rentStartedAtUtc: undefined,
+                  rentExpiresAtUtc: undefined,
+                  rentTimeRemainingSeconds: undefined,
+                  renterAddress: undefined
+                }
+                if (idx >= 0) {
+                  updatedCachedGifts[idx] = updatedPastGift
+                } else {
+                  updatedCachedGifts.push(updatedPastGift)
+                }
               }
             }
           } catch (err) {
@@ -443,10 +495,12 @@ export class RentalScanner {
         const updatedState: PersistentWalletState = {
           ...existingState,
           friendlyAddress: friendlyAddress || existingState.friendlyAddress,
-          lastScannedLt: maxLt || existingState.lastScannedLt,
+          lastScannedLt: effectiveLastScannedLt,
           lastScannedTimestamp: nowSeconds,
+          fullHistoryScanned: effectiveFullHistoryScanned,
           cachedGifts: updatedCachedGifts,
-          contractToNftMap
+          contractToNftMap,
+          nonRentalContracts: Array.from(nonRentalContracts)
         }
         this.saveState(updatedState)
 
@@ -476,8 +530,13 @@ export class RentalScanner {
     const allPayoutsList = Array.from(allPayoutsMap.values())
     const unmappedSenders = Array.from(new Set(
       allPayoutsList
-        .filter(p => !p.nftAddress && p.senderAddress && !contractToNftMap[p.senderAddress])
-        .map(p => p.senderAddress)
+        .filter(p =>
+          !p.nftAddress &&
+          this.isValidContractAddress(p.senderAddress) &&
+          !contractToNftMap[p.senderAddress.toLowerCase()] &&
+          !nonRentalContracts.has(p.senderAddress.toLowerCase())
+        )
+        .map(p => p.senderAddress.toLowerCase())
     ))
 
     if (unmappedSenders.length > 0) {
@@ -494,66 +553,73 @@ export class RentalScanner {
 
         let resolvedNft: string | null = null
 
-        // 1. Try Tonnel get_params (stack[0] contains the NFT address cell)
+        // 1. Try MarketApp blockchain account data first (cheaper & most common)
         try {
-          const getParams = await this.client.runGetMethod(sender, 'get_params')
-          if (getParams?.success && getParams.stack && getParams.stack.length >= 1) {
-            const cell = getParams.stack[0]?.cell
-            if (cell) {
-              const parsed = BocParser.parseAddressFromCell(cell)
-              if (parsed) {
-                resolvedNft = parsed.toLowerCase()
-                contractToNftMap[sender] = resolvedNft
-                candidateNfts.add(resolvedNft)
-              }
+          const acc = await this.client.getBlockchainAccount(sender)
+          if (acc?.data) {
+            const extracted = BocParser.extractMarketAppNftAddress(acc.data)
+            if (extracted) {
+              resolvedNft = extracted.toLowerCase()
+              contractToNftMap[sender] = resolvedNft
+              candidateNfts.add(resolvedNft)
             }
           }
         } catch {
-          // Ignore
+          // Ignore single payout resolve error
         }
 
-        // 2. Try MarketApp blockchain account data
+        // 2. Try Tonnel get_params (stack[0] contains the NFT address cell)
         if (!resolvedNft) {
           try {
-            const acc = await this.client.getBlockchainAccount(sender)
-            if (acc?.data) {
-              const extracted = BocParser.extractMarketAppNftAddress(acc.data)
-              if (extracted) {
-                resolvedNft = extracted.toLowerCase()
-                contractToNftMap[sender] = resolvedNft
-                candidateNfts.add(resolvedNft)
+            const getParams = await this.client.runGetMethod(sender, 'get_params')
+            if (getParams?.success && getParams.stack && getParams.stack.length >= 1) {
+              const cell = getParams.stack[0]?.cell
+              if (cell) {
+                const parsed = BocParser.parseAddressFromCell(cell)
+                if (parsed) {
+                  resolvedNft = parsed.toLowerCase()
+                  contractToNftMap[sender] = resolvedNft
+                  candidateNfts.add(resolvedNft)
+                }
               }
             }
           } catch {
-            // Ignore single payout resolve error
+            // Ignore
           }
         }
       }
     }
 
-    // Now map all payouts to resolved NFT addresses and resolve missing renterAddress
+    // Now map all payouts to resolved NFT addresses and resolve missing renterAddress once
     for (const payout of allPayoutsList) {
-      if (!payout.nftAddress && payout.senderAddress && contractToNftMap[payout.senderAddress]) {
-        payout.nftAddress = contractToNftMap[payout.senderAddress]
+      const senderKey = payout.senderAddress?.toLowerCase()
+      if (!payout.nftAddress && senderKey && contractToNftMap[senderKey]) {
+        payout.nftAddress = contractToNftMap[senderKey]
       }
-      if (!payout.renterAddress && payout.eventId) {
+      if (payout.renterAddress && !payout.renterResolved) {
+        payout.renterResolved = true
+      } else if (!payout.renterAddress && !payout.renterResolved && payout.eventId) {
         try {
           const fullEv = await this.client.getEvent(payout.eventId)
-          if (fullEv?.actions) {
-            for (const a of fullEv.actions) {
-              if (a.type === 'SmartContractExec' && a.SmartContractExec) {
-                const ex = a.SmartContractExec.executor
-                const exAddr = ex?.address?.toLowerCase()
-                const isWallet = ex?.is_wallet ?? false
-                if (exAddr && exAddr !== targetWallet && exAddr !== payout.senderAddress?.toLowerCase() && isWallet) {
-                  payout.renterAddress = exAddr
-                  break
+          if (fullEv) {
+            if (fullEv.actions) {
+              for (const a of fullEv.actions) {
+                if (a.type === 'SmartContractExec' && a.SmartContractExec) {
+                  const ex = a.SmartContractExec.executor
+                  const exAddr = ex?.address?.toLowerCase()
+                  const isWallet = ex?.is_wallet ?? false
+                  if (exAddr && exAddr !== targetWallet && exAddr !== senderKey && isWallet) {
+                    payout.renterAddress = exAddr
+                    break
+                  }
                 }
               }
             }
+            // Mark resolved even if no wallet SmartContractExec exists on-chain so we don't re-fetch forever
+            payout.renterResolved = true
           }
         } catch {
-          // Ignore
+          // Ignore transient error; will retry next time
         }
       }
     }
@@ -583,11 +649,17 @@ export class RentalScanner {
       }
     }
 
-    // Filter to NFTs that are currently NOT in the target wallet (i.e. held by rental contracts)
+    // Filter to NFTs that are currently NOT in the target wallet (i.e. held by candidate rental contracts)
     const activeCandidates = allCandidatesList.filter(nftAddr => {
       const nft = nftMap.get(nftAddr.toLowerCase())
       if (!nft || !nft.owner?.address) return true // Inspect if bulk didn't return owner
-      return nft.owner.address.toLowerCase() !== targetWallet && !nft.owner.is_wallet
+      const ownerAddr = nft.owner.address.toLowerCase()
+      return (
+        ownerAddr !== targetWallet &&
+        !nft.owner.is_wallet &&
+        !KNOWN_NON_RENTAL_ROUTERS.has(ownerAddr) &&
+        !nonRentalContracts.has(ownerAddr)
+      )
     })
     const totalCandidates = activeCandidates.length
 
@@ -618,7 +690,7 @@ export class RentalScanner {
     const candidatesToInspectOnChain: string[] = []
     for (const nftAddr of activeCandidates) {
       const lower = nftAddr.toLowerCase()
-      if (cachedActiveRentedMap.has(lower) && !returnedNfts.has(lower)) {
+      if (!forceRefresh && cachedActiveRentedMap.has(lower) && !returnedNfts.has(lower)) {
         const cachedGift = cachedActiveRentedMap.get(lower)!
         const expEpoch = Math.floor(new Date(cachedGift.rentExpiresAtUtc!).getTime() / 1000)
         const remainingSeconds = Math.max(0, expEpoch - nowSeconds)
@@ -658,6 +730,7 @@ export class RentalScanner {
             targetWallet,
             nowSeconds,
             contractToNftMap,
+            nonRentalContracts,
             cachedNft
           )
           if (giftDetail) {
@@ -715,7 +788,13 @@ export class RentalScanner {
     for (const [nftAddr, nftPayouts] of Object.entries(payoutsByNft)) {
       if (!activeGiftsByAddress.has(nftAddr)) {
         const prevCached = cachedPastGiftsMap.get(nftAddr)
-        if (prevCached && !forceRefresh && prevCached.status === 'In Wallet') {
+        const wasMovedThisScan = returnedNfts.has(nftAddr) || newCandidates.has(nftAddr)
+        if (
+          prevCached &&
+          !forceRefresh &&
+          !wasMovedThisScan &&
+          (prevCached.status === 'In Wallet' || prevCached.status === 'Not Owned')
+        ) {
           const totalEarned = Math.round(nftPayouts.reduce((sum, h) => sum + h.amountTon, 0) * 1000) / 1000
           allGifts.push({
             ...prevCached,
@@ -737,12 +816,19 @@ export class RentalScanner {
 
             // Resilient fallback: if owner is a smart contract (not personal wallet), inspect rental!
             let activeRental: GiftRentalDetail | null = null
-            if (currentOwner && currentOwner !== targetWallet && !isWallet) {
+            if (
+              currentOwner &&
+              currentOwner !== targetWallet &&
+              !isWallet &&
+              this.isValidContractAddress(currentOwner) &&
+              !nonRentalContracts.has(currentOwner)
+            ) {
               activeRental = await this.inspectNftRental(
                 nftAddr,
                 targetWallet,
                 nowSeconds,
                 contractToNftMap,
+                nonRentalContracts,
                 nftItem || undefined
               )
             }
@@ -756,7 +842,13 @@ export class RentalScanner {
               allGifts.push(activeRental)
               activeGiftsByAddress.set(nftAddr, activeRental)
             } else {
-              const status: 'Not Owned' | 'In Wallet' = (currentOwner && currentOwner === targetWallet) ? 'In Wallet' : 'Not Owned'
+              const fallbackStatus: 'Not Owned' | 'In Wallet' =
+                (prevCached && (prevCached.status === 'In Wallet' || prevCached.status === 'Not Owned'))
+                  ? prevCached.status
+                  : 'In Wallet'
+              const status: 'Not Owned' | 'In Wallet' = currentOwner
+                ? (currentOwner === targetWallet ? 'In Wallet' : 'Not Owned')
+                : fallbackStatus
               allGifts.push({
                 name: displayName,
                 collectionName,
@@ -803,13 +895,15 @@ export class RentalScanner {
     const updatedState: PersistentWalletState = {
       walletAddress: targetWallet,
       friendlyAddress: friendlyAddress || existingState?.friendlyAddress,
-      lastScannedLt: maxLt || existingState?.lastScannedLt || null,
+      lastScannedLt: effectiveLastScannedLt,
       lastScannedTimestamp: nowSeconds,
+      fullHistoryScanned: effectiveFullHistoryScanned,
       payouts: allPayouts,
       cachedGifts: allGifts,
       candidateNfts: Array.from(candidateNfts),
       contractToNftMap,
-      nftAddressToNameMap
+      nftAddressToNameMap,
+      nonRentalContracts: Array.from(nonRentalContracts)
     }
     this.saveState(updatedState)
 
@@ -832,6 +926,7 @@ export class RentalScanner {
     targetWallet: string,
     nowSeconds: number,
     contractToNftMap: Record<string, string>,
+    nonRentalContracts: Set<string>,
     prefetchedNft?: TonNftItem
   ): Promise<GiftRentalDetail | null> {
     const nft = prefetchedNft || await this.client.getNft(nftAddress)
@@ -839,8 +934,13 @@ export class RentalScanner {
 
     const currentOwner = nft.owner.address.toLowerCase()
 
-    // If held directly in wallet or personal wallet, it's NOT in a rental contract
-    if (currentOwner === targetWallet || nft.owner.is_wallet) {
+    // If held directly in wallet, personal wallet, or known non-rental contract, skip
+    if (
+      currentOwner === targetWallet ||
+      nft.owner.is_wallet ||
+      !this.isValidContractAddress(currentOwner) ||
+      nonRentalContracts.has(currentOwner)
+    ) {
       return null
     }
 
@@ -851,89 +951,102 @@ export class RentalScanner {
     const displayName = `${collectionName} #${number}`
     const imageUrl = nft.metadata?.image || nft.previews?.[1]?.url || nft.previews?.[0]?.url
 
-    // 1. Check Tonnel rental get_params
+    let marketAppCheckCompleted = false
+    let tonnelCheckCompleted = false
+
+    // 1. Check MarketApp rental contract BoC FIRST (cheaper and most common)
     try {
-      const getParams = await this.client.runGetMethod(currentOwner, 'get_params')
-      if (getParams?.success && getParams.stack && getParams.stack.length >= 6) {
-        const ownerCell = getParams.stack[1]?.cell || ''
-        const contractOwner = BocParser.parseAddressFromCell(ownerCell)
-        if (contractOwner && contractOwner.toLowerCase() === targetWallet) {
-          const startTime = BocParser.parseHexNumber(getParams.stack[2]?.num || '0')
-          const durationSeconds = BocParser.parseHexNumber(getParams.stack[3]?.num || '0')
-          const priceNano = BocParser.parseHexNumber(getParams.stack[4]?.num || '0')
-          const priceTon = Math.round((priceNano / 1_000_000_000) * 1000) / 1000
+      const account = await this.client.getBlockchainAccount(currentOwner)
+      if (account !== null) {
+        marketAppCheckCompleted = true
+        if (account.data) {
+          const parsed = BocParser.parseMarketAppRental(account.data, targetWallet, nowSeconds)
+          if (parsed) {
+            if (this.isValidContractAddress(parsed.linkedContractAddress)) {
+              contractToNftMap[parsed.linkedContractAddress!.toLowerCase()] = nftAddress.toLowerCase()
+            }
 
-          const isRented = startTime > 0
-          const status: 'Rented' | 'Listed for Rent' = isRented ? 'Rented' : 'Listed for Rent'
-          const expireTimestamp = isRented ? startTime + durationSeconds : 0
-          const remainingSeconds = isRented && expireTimestamp > 0 ? Math.max(0, expireTimestamp - nowSeconds) : undefined
+            const rentStartedAtUtc = parsed.startTime ? new Date(parsed.startTime * 1000).toUTCString() : undefined
+            const rentExpiresAtUtc = parsed.expireTime ? new Date(parsed.expireTime * 1000).toUTCString() : undefined
 
-          const rawRenterHex = getParams.stack[5]?.num || '0x0'
-          let renterAddress: string | undefined = undefined
-          if (isRented && rawRenterHex !== '0x0' && rawRenterHex !== '0' && rawRenterHex.length > 10) {
-            const cleanHex = rawRenterHex.toLowerCase().replace('0x', '').padStart(64, '0')
-            renterAddress = `0:${cleanHex}`
-          }
-
-          return {
-            name: displayName,
-            collectionName,
-            number,
-            imageUrl,
-            nftAddress,
-            status,
-            priceTon,
-            durationDays: Math.max(1, Math.floor(durationSeconds / 86400)),
-            rentStartedAtUtc: isRented ? new Date(startTime * 1000).toUTCString() : undefined,
-            rentExpiresAtUtc: isRented && expireTimestamp > 0 ? new Date(expireTimestamp * 1000).toUTCString() : undefined,
-            rentTimeRemainingSeconds: remainingSeconds,
-            timesRented: isRented ? 1 : 0,
-            totalEarnedTon: 0,
-            renterAddress,
-            history: [],
-            url: `https://tonviewer.com/${nftAddress}`
+            return {
+              name: displayName,
+              collectionName,
+              number,
+              imageUrl,
+              nftAddress,
+              status: parsed.status,
+              priceTon: parsed.priceTon,
+              durationDays: parsed.durationDays,
+              rentStartedAtUtc,
+              rentExpiresAtUtc,
+              rentTimeRemainingSeconds: parsed.remainingSeconds ?? undefined,
+              timesRented: parsed.status === 'Rented' ? 1 : 0,
+              totalEarnedTon: 0,
+              renterAddress: parsed.renterAddress ?? undefined,
+              history: [],
+              url: `https://tonviewer.com/${nftAddress}`
+            }
           }
         }
       }
     } catch {
-      // Continue to MarketApp check
+      // Continue to Tonnel check
     }
 
-    // 2. Check MarketApp rental contract BoC
+    // 2. Check Tonnel rental get_params SECOND
     try {
-      const account = await this.client.getBlockchainAccount(currentOwner)
-      if (account?.data) {
-        const parsed = BocParser.parseMarketAppRental(account.data, targetWallet, nowSeconds)
-        if (parsed) {
-          if (parsed.linkedContractAddress) {
-            contractToNftMap[parsed.linkedContractAddress.toLowerCase()] = nftAddress.toLowerCase()
-          }
+      const getParams = await this.client.runGetMethod(currentOwner, 'get_params')
+      if (getParams !== null) {
+        tonnelCheckCompleted = true
+        if (getParams.success && getParams.stack && getParams.stack.length >= 6) {
+          const ownerCell = getParams.stack[1]?.cell || ''
+          const contractOwner = BocParser.parseAddressFromCell(ownerCell)
+          if (contractOwner && contractOwner.toLowerCase() === targetWallet) {
+            const startTime = BocParser.parseHexNumber(getParams.stack[2]?.num || '0')
+            const durationSeconds = BocParser.parseHexNumber(getParams.stack[3]?.num || '0')
+            const priceNano = BocParser.parseHexNumber(getParams.stack[4]?.num || '0')
+            const priceTon = Math.round((priceNano / 1_000_000_000) * 1000) / 1000
 
-          const rentStartedAtUtc = parsed.startTime ? new Date(parsed.startTime * 1000).toUTCString() : undefined
-          const rentExpiresAtUtc = parsed.expireTime ? new Date(parsed.expireTime * 1000).toUTCString() : undefined
+            const isRented = startTime > 0
+            const status: 'Rented' | 'Listed for Rent' = isRented ? 'Rented' : 'Listed for Rent'
+            const expireTimestamp = isRented ? startTime + durationSeconds : 0
+            const remainingSeconds = isRented && expireTimestamp > 0 ? Math.max(0, expireTimestamp - nowSeconds) : undefined
 
-          return {
-            name: displayName,
-            collectionName,
-            number,
-            imageUrl,
-            nftAddress,
-            status: parsed.status,
-            priceTon: parsed.priceTon,
-            durationDays: parsed.durationDays,
-            rentStartedAtUtc,
-            rentExpiresAtUtc,
-            rentTimeRemainingSeconds: parsed.remainingSeconds ?? undefined,
-            timesRented: parsed.status === 'Rented' ? 1 : 0,
-            totalEarnedTon: 0,
-            renterAddress: parsed.renterAddress ?? undefined,
-            history: [],
-            url: `https://tonviewer.com/${nftAddress}`
+            const rawRenterHex = getParams.stack[5]?.num || '0x0'
+            let renterAddress: string | undefined = undefined
+            if (isRented && rawRenterHex !== '0x0' && rawRenterHex !== '0' && rawRenterHex.length > 10) {
+              const cleanHex = rawRenterHex.toLowerCase().replace('0x', '').padStart(64, '0')
+              renterAddress = `0:${cleanHex}`
+            }
+
+            return {
+              name: displayName,
+              collectionName,
+              number,
+              imageUrl,
+              nftAddress,
+              status,
+              priceTon,
+              durationDays: Math.max(1, Math.floor(durationSeconds / 86400)),
+              rentStartedAtUtc: isRented ? new Date(startTime * 1000).toUTCString() : undefined,
+              rentExpiresAtUtc: isRented && expireTimestamp > 0 ? new Date(expireTimestamp * 1000).toUTCString() : undefined,
+              rentTimeRemainingSeconds: remainingSeconds,
+              timesRented: isRented ? 1 : 0,
+              totalEarnedTon: 0,
+              renterAddress,
+              history: [],
+              url: `https://tonviewer.com/${nftAddress}`
+            }
           }
         }
       }
     } catch {
       // Ignore
+    }
+
+    if (marketAppCheckCompleted && tonnelCheckCompleted) {
+      nonRentalContracts.add(currentOwner)
     }
 
     return null

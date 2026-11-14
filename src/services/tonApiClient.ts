@@ -13,8 +13,8 @@ export interface TonEventAction {
   TonTransfer?: {
     amount: number
     comment?: string
-    recipient: { address: string; name?: string }
-    sender: { address: string; name?: string }
+    recipient: { address: string; name?: string; is_wallet?: boolean }
+    sender: { address: string; name?: string; is_wallet?: boolean }
   }
   NftItemTransfer?: {
     nft: string

@@ -19,6 +19,7 @@ interface RawCell {
   idx: number
   refs: number[]
   data: Uint8Array
+  hasCompletionTag: boolean
 }
 
 export class BocParser {
@@ -35,8 +36,13 @@ export class BocParser {
       const cells = this.parseBocCells(bocHex)
       if (cells.length < 4) return null
 
+      const rootCell = cells[0]
+      const cell1 = (rootCell.refs.length >= 1 && rootCell.refs[0] < cells.length) ? cells[rootCell.refs[0]] : cells[1]
+      const cell2 = (rootCell.refs.length >= 2 && rootCell.refs[1] < cells.length) ? cells[rootCell.refs[1]] : cells[2]
+      const cell3 = (rootCell.refs.length >= 3 && rootCell.refs[2] < cells.length) ? cells[rootCell.refs[2]] : cells[3]
+
       // Cell 1: owner (bit 0..267), nftAddress (bit 267..534), startTime (bit 833..865)
-      const c1Bits = this.toBits(cells[1].data)
+      const c1Bits = this.toBits(cell1.data, cell1.hasCompletionTag)
       if (c1Bits.length < 865) return null
 
       const ownerRes = this.readAddress(c1Bits, 0)
@@ -52,26 +58,42 @@ export class BocParser {
 
       const startTime = this.readUint32(c1Bits, 833)
 
-      // Cell 2: isListed flag (bit 0), expireTime (bit 67..99), renter (candidate offsets), linkedContract
-      const c2Bits = this.toBits(cells[2].data)
+      // Cell 2: isListed flag (bit 0), expireTime (bit 67..99), Coins length prefix (bit 99..103), renter, linkedContract
+      const c2Bits = this.toBits(cell2.data, cell2.hasCompletionTag)
       const isListedBit = c2Bits.length > 0 && c2Bits[0] === '1'
       const expireTime = c2Bits.length >= 99 ? this.readUint32(c2Bits, 67) : 0
 
       let renterAddr: string | null = null
       let linkedContract: string | null = null
-      const candidateOffsets = [135, 127, 119, 143, 151]
+      const candidateOffsets: number[] = []
+      if (c2Bits.length >= 103) {
+        const c2CoinsLen = parseInt(c2Bits.substring(99, 103), 2)
+        const exactPos = 103 + c2CoinsLen * 8
+        candidateOffsets.push(exactPos)
+      }
+      for (const fallback of [135, 127, 119, 143, 151]) {
+        if (!candidateOffsets.includes(fallback)) {
+          candidateOffsets.push(fallback)
+        }
+      }
+
       for (const pos of candidateOffsets) {
-        if (c2Bits.length >= pos + 267) {
+        if (c2Bits.length >= pos + 2) {
           const renterRes = this.readAddress(c2Bits, pos)
-          if (renterRes && renterRes.address !== 'None' && !renterRes.address.startsWith('-')) {
-            renterAddr = renterRes.address
-            if (c2Bits.length >= pos + 267 + 267) {
-              const linkedRes = this.readAddress(c2Bits, pos + 267)
+          if (renterRes) {
+            if (renterRes.address !== 'None' && !renterRes.address.startsWith('-')) {
+              renterAddr = renterRes.address
+            }
+            const nextPos = renterRes.nextPos
+            if (c2Bits.length >= nextPos + 2) {
+              const linkedRes = this.readAddress(c2Bits, nextPos)
               if (linkedRes && linkedRes.address !== 'None' && !linkedRes.address.startsWith('-')) {
                 linkedContract = linkedRes.address
               }
             }
-            break
+            if (renterAddr !== null || pos === candidateOffsets[0]) {
+              break
+            }
           }
         }
       }
@@ -81,7 +103,7 @@ export class BocParser {
       const status: 'Rented' | 'Listed for Rent' = isRented ? 'Rented' : 'Listed for Rent'
 
       // Cell 3: minDuration (bit 1..33), maxDuration (bit 33..65), priceNano (bit 65..)
-      const c3Bits = this.toBits(cells[3].data)
+      const c3Bits = this.toBits(cell3.data, cell3.hasCompletionTag)
       if (c3Bits.length < 69) return null
 
       const minDuration = this.readUint32(c3Bits, 1)
@@ -138,10 +160,12 @@ export class BocParser {
     try {
       const cells = this.parseBocCells(bocHex)
       if (cells.length < 2) return null
-      const c1Bits = this.toBits(cells[1].data)
+      const rootCell = cells[0]
+      const cell1 = (rootCell.refs.length >= 1 && rootCell.refs[0] < cells.length) ? cells[rootCell.refs[0]] : cells[1]
+      const c1Bits = this.toBits(cell1.data, cell1.hasCompletionTag)
       if (c1Bits.length < 534) return null
       const res = this.readAddress(c1Bits, 267)
-      return res ? res.address : null
+      return res && res.address !== 'None' ? res.address : null
     } catch {
       return null
     }
@@ -152,6 +176,17 @@ export class BocParser {
    */
   static parseAddressFromCell(cellBocHex: string): string | null {
     try {
+      // 1. Parse BoC structure properly and read MsgAddressInt from root cell bitstream
+      const cells = this.parseBocCells(cellBocHex)
+      if (cells.length > 0) {
+        const rootBits = this.toBits(cells[0].data, cells[0].hasCompletionTag)
+        const addrRes = this.readAddress(rootBits, 0)
+        if (addrRes && addrRes.address !== 'None') {
+          return addrRes.address
+        }
+      }
+
+      // 2. Fallback for raw bit-hex without standard BoC header
       const idx = cellBocHex.indexOf('80')
       if (idx === -1) return null
       const dataHex = cellBocHex.substring(idx)
@@ -161,29 +196,8 @@ export class BocParser {
         if (isNaN(d)) continue
         bits += d.toString(2).padStart(4, '0')
       }
-      if (bits.length < 267) return null
-      const tag = bits.substring(0, 2)
-      if (tag !== '10') return null
-
-      let pos = 3
-      const anycast = bits[2]
-      if (anycast === '1') {
-        const depth = parseInt(bits.substring(pos, pos + 5), 2)
-        pos += 5 + depth
-      }
-
-      if (pos + 8 + 256 > bits.length) return null
-      const wcBits = bits.substring(pos, pos + 8)
-      // signed 8-bit workchain
-      const wcUnsigned = parseInt(wcBits, 2)
-      const workchain = wcUnsigned >= 128 ? wcUnsigned - 256 : wcUnsigned
-      pos += 8
-
-      const addrBits = bits.substring(pos, pos + 256)
-      const addrBigInt = BigInt('0b' + addrBits)
-      const hexAddress = addrBigInt.toString(16).padStart(64, '0')
-
-      return `${workchain}:${hexAddress}`
+      const fallbackRes = this.readAddress(bits, 0)
+      return fallbackRes && fallbackRes.address !== 'None' ? fallbackRes.address : null
     } catch {
       return null
     }
@@ -203,15 +217,21 @@ export class BocParser {
   }
 
   static parseHexNumber(hexStr: string): number {
-    const clean = hexStr.toLowerCase().startsWith('0x') ? hexStr.substring(2) : hexStr
-    return parseInt(clean, 16) || 0
+    const trimmed = hexStr.trim()
+    const clean = trimmed.toLowerCase().startsWith('0x') ? trimmed.substring(2) : trimmed
+    if (!clean) return 0
+    try {
+      return Number(BigInt('0x' + clean))
+    } catch {
+      return parseInt(clean, 16) || 0
+    }
   }
 
   // ---- Low-level helpers ----
 
   private static readUint32(bits: string, startBit: number): number {
     if (startBit + 32 > bits.length) return 0
-    return parseInt(bits.substring(startBit, startBit + 32), 2)
+    return parseInt(bits.substring(startBit, startBit + 32), 2) >>> 0
   }
 
   private static readAddress(bits: string, pos: number): { address: string; nextPos: number } | null {
@@ -260,7 +280,7 @@ export class BocParser {
     const readInt = (bytesCount: number): number => {
       let res = 0
       for (let i = 0; i < bytesCount; i++) {
-        res = (res << 8) | b[pos + i]
+        res = res * 256 + (b[pos + i] & 0xff)
       }
       pos += bytesCount
       return res
@@ -287,7 +307,8 @@ export class BocParser {
       const d2 = b[pos + 1]
       pos += 2
       const refsCnt = d1 & 7
-      const dataLen = (d2 >> 1) + ((d2 & 1) !== 0 ? 1 : 0)
+      const hasCompletionTag = (d2 & 1) !== 0
+      const dataLen = (d2 >> 1) + (hasCompletionTag ? 1 : 0)
 
       if (pos + dataLen > b.length) break
       const cdata = b.slice(pos, pos + dataLen)
@@ -298,17 +319,26 @@ export class BocParser {
         if (pos + size > b.length) break
         refs.push(readInt(size))
       }
-      cells.push({ idx: i, refs, data: cdata })
+      cells.push({ idx: i, refs, data: cdata, hasCompletionTag })
     }
     return cells
   }
 
-  private static toBits(bytes: Uint8Array): string {
+  private static toBits(bytes: Uint8Array, hasCompletionTag = false): string {
     let s = ''
     for (let i = 0; i < bytes.length; i++) {
       const v = bytes[i]
       for (let j = 7; j >= 0; j--) {
         s += ((v & (1 << j)) !== 0) ? '1' : '0'
+      }
+    }
+    if (hasCompletionTag && s.length > 0) {
+      let end = s.length - 1
+      while (end >= 0 && s[end] === '0') {
+        end--
+      }
+      if (end >= 0 && s[end] === '1') {
+        return s.substring(0, end)
       }
     }
     return s
@@ -317,8 +347,8 @@ export class BocParser {
   private static hexToBytes(hex: string): Uint8Array {
     const cleanHex = hex.trim()
     const len = cleanHex.length
-    const bytes = new Uint8Array(len / 2)
-    for (let i = 0; i < len; i += 2) {
+    const bytes = new Uint8Array(Math.floor(len / 2))
+    for (let i = 0; i + 1 < len; i += 2) {
       bytes[i / 2] = parseInt(cleanHex.substring(i, i + 2), 16)
     }
     return bytes
