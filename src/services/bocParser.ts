@@ -172,6 +172,51 @@ export class BocParser {
   }
 
   /**
+   * Extracts rented duration in days from a MarketApp rental payment transaction's incoming message BoC (`op = 0xedcdab69`).
+   * Supports both v2 (2-cell with payload in ref[0]) and v1 (single-cell inline) formats.
+   */
+  static extractMarketAppRentDurationDays(rawBodyHex: string, expectedContractAddress?: string): number | null {
+    try {
+      const cells = this.parseBocCells(rawBodyHex)
+      if (cells.length === 0) return null
+      const c0 = cells[0]
+      const c0Bits = this.toBits(c0.data, c0.hasCompletionTag)
+      if (c0Bits.length < 32) return null
+      if (this.readUint32(c0Bits, 0) !== 0xedcdab69) return null
+
+      let durationSeconds: number | null = null
+      if (c0.refs.length > 0 && c0.refs[0] < cells.length) {
+        const c1 = cells[c0.refs[0]]
+        const c1Bits = this.toBits(c1.data, c1.hasCompletionTag)
+        const addrRes = this.readAddress(c1Bits, 0)
+        if (!addrRes) return null
+        if (expectedContractAddress && addrRes.address.toLowerCase() !== expectedContractAddress.toLowerCase()) {
+          return null
+        }
+        const coinsPos = addrRes.nextPos + 32
+        if (coinsPos + 4 > c1Bits.length) return null
+        const coinsLen = parseInt(c1Bits.substring(coinsPos, coinsPos + 4), 2)
+        const durPos = coinsPos + 4 + coinsLen * 8
+        if (durPos + 32 > c1Bits.length) return null
+        durationSeconds = this.readUint32(c1Bits, durPos)
+      } else if (c0.refs.length === 0 && c0Bits.length >= 544 + 4 + 32) {
+        const coinsPos = 544
+        const coinsLen = parseInt(c0Bits.substring(coinsPos, coinsPos + 4), 2)
+        const durPos = coinsPos + 4 + coinsLen * 8
+        if (durPos + 32 > c0Bits.length) return null
+        durationSeconds = this.readUint32(c0Bits, durPos)
+      }
+
+      if (durationSeconds !== null && durationSeconds >= 3600 && durationSeconds <= 3650 * 86400) {
+        return Math.max(1, Math.round(durationSeconds / 86400))
+      }
+      return null
+    } catch {
+      return null
+    }
+  }
+
+  /**
    * Parses standard 0:hex address from Ton BoC cell hex representation (TL-B MsgAddressInt).
    */
   static parseAddressFromCell(cellBocHex: string): string | null {

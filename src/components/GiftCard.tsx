@@ -191,9 +191,16 @@ export const GiftCard: React.FC<GiftCardProps> = ({
               className="flex items-center justify-between p-2 rounded-xl bg-slate-950/60 text-[11px] border border-slate-800/50"
             >
               <div className="min-w-0 pr-2">
-                <span className="font-semibold text-emerald-400 block">
-                  +{payout.amountTon} TON
-                </span>
+                <div className="flex items-center gap-1.5">
+                  <span className="font-semibold text-emerald-400">
+                    +{payout.amountTon} TON
+                  </span>
+                  {(payout.durationDays ?? 0) > 0 && (
+                    <span className="px-1.5 py-0.5 rounded bg-slate-800 text-sky-400 font-mono text-[10px]">
+                      {payout.durationDays}д
+                    </span>
+                  )}
+                </div>
                 <span className="text-[10px] text-slate-500 truncate block">
                   {new Date(payout.timestamp * 1000).toLocaleDateString('ru-RU', {
                     day: 'numeric',

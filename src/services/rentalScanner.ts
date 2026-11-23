@@ -1,5 +1,5 @@
 import { BocParser } from './bocParser'
-import { TonApiClient, TonNftItem } from './tonApiClient'
+import { TonApiClient, TonNftItem, TonTraceNode } from './tonApiClient'
 import {
   GiftRentalDetail,
   RentalDashboardResponse,
@@ -45,6 +45,24 @@ export class RentalScanner {
     if (!addr) return false
     const clean = addr.trim().toLowerCase()
     return clean.length > 0 && !KNOWN_NON_RENTAL_ROUTERS.has(clean)
+  }
+
+  private extractDurationFromTrace(trace: TonTraceNode, contractAddress: string): number | null {
+    const acc = trace.transaction?.account?.address
+    if (acc && acc.toLowerCase() === contractAddress.toLowerCase()) {
+      const rawBody = trace.transaction?.in_msg?.raw_body
+      if (rawBody) {
+        const days = BocParser.extractMarketAppRentDurationDays(rawBody, contractAddress)
+        if (days !== null) return days
+      }
+    }
+    if (trace.children) {
+      for (const child of trace.children) {
+        const found = this.extractDurationFromTrace(child, contractAddress)
+        if (found !== null) return found
+      }
+    }
+    return null
   }
 
   /**
@@ -191,9 +209,13 @@ export class RentalScanner {
       )
     )
 
+    const hasUnresolvedDurations = Boolean(
+      existingState?.payouts?.some(p => (!p.durationDays || p.durationDays <= 0) && !p.durationResolved)
+    )
+
     // Fast-path 1: if cached state is fresh (< ttlSeconds) and not force refresh, recalculate remaining times in memory
     const cacheAgeSeconds = existingState ? (nowSeconds - existingState.lastScannedTimestamp) : 999999
-    if (!forceRefresh && hasCachedData && cacheAgeSeconds < ttlSeconds) {
+    if (!forceRefresh && hasCachedData && cacheAgeSeconds < ttlSeconds && !hasUnresolvedDurations) {
       onProgress({
         stage: 'done',
         message: 'Загружено из локального кэша',
@@ -223,7 +245,10 @@ export class RentalScanner {
     if (existingState && existingState.payouts) {
       for (const p of existingState.payouts) {
         if (!forceRefresh) {
-          allPayoutsMap.set(p.eventId, p)
+          allPayoutsMap.set(p.eventId, {
+            ...p,
+            durationResolved: p.durationResolved || Boolean(p.durationDays && p.durationDays > 0)
+          })
         }
         if (p.nftAddress) {
           candidateNfts.add(p.nftAddress.toLowerCase())
@@ -400,8 +425,8 @@ export class RentalScanner {
     ))
 
     // Fast-path 2 (Kotlin parity):
-    // If state exists, forceRefresh is false, no new rental payouts/transfers occurred, and no legacy unresolved renters
-    if (!forceRefresh && existingState && !hasNewTransactions && !hasUnresolvedRenters) {
+    // If state exists, forceRefresh is false, no new rental payouts/transfers occurred, and no legacy unresolved renters/durations
+    if (!forceRefresh && existingState && !hasNewTransactions && !hasUnresolvedRenters && !hasUnresolvedDurations) {
       if (expiredRentedGifts.length === 0) {
         // Case A: No new transactions AND no gift rentals have expired!
         // No need to inspect ANY contracts on-chain.
@@ -539,6 +564,9 @@ export class RentalScanner {
         .map(p => p.senderAddress.toLowerCase())
     ))
 
+    const senderDurationMap: Record<string, number> = {}
+    const checkedTonnelDurationSenders = new Set<string>()
+
     if (unmappedSenders.length > 0) {
       let senderIdx = 0
       for (const sender of unmappedSenders) {
@@ -568,10 +596,13 @@ export class RentalScanner {
           // Ignore single payout resolve error
         }
 
-        // 2. Try Tonnel get_params (stack[0] contains the NFT address cell)
+        // 2. Try Tonnel get_params (stack[0] contains the NFT address cell, stack[3] duration)
         if (!resolvedNft) {
           try {
             const getParams = await this.client.runGetMethod(sender, 'get_params')
+            if (getParams !== null) {
+              checkedTonnelDurationSenders.add(sender)
+            }
             if (getParams?.success && getParams.stack && getParams.stack.length >= 1) {
               const cell = getParams.stack[0]?.cell
               if (cell) {
@@ -582,6 +613,12 @@ export class RentalScanner {
                   candidateNfts.add(resolvedNft)
                 }
               }
+              if (getParams.stack.length >= 4 && getParams.stack[3]?.num) {
+                const durSec = BocParser.parseHexNumber(getParams.stack[3].num)
+                if (durSec > 0) {
+                  senderDurationMap[sender] = Math.max(1, Math.round(durSec / 86400))
+                }
+              }
             }
           } catch {
             // Ignore
@@ -590,7 +627,7 @@ export class RentalScanner {
       }
     }
 
-    // Now map all payouts to resolved NFT addresses and resolve missing renterAddress once
+    // Now map all payouts to resolved NFT addresses and resolve missing renterAddress & durationDays once
     for (const payout of allPayoutsList) {
       const senderKey = payout.senderAddress?.toLowerCase()
       if (!payout.nftAddress && senderKey && contractToNftMap[senderKey]) {
@@ -620,6 +657,51 @@ export class RentalScanner {
           }
         } catch {
           // Ignore transient error; will retry next time
+        }
+      }
+
+      if (payout.durationDays && payout.durationDays > 0) {
+        payout.durationResolved = true
+      } else if (!payout.durationResolved) {
+        const isMarketApp = (payout.comment || '').toLowerCase().includes('marketapp')
+        if (isMarketApp && payout.eventId && senderKey) {
+          try {
+            const trace = await this.client.getTrace(payout.eventId)
+            if (trace) {
+              const days = this.extractDurationFromTrace(trace, senderKey)
+              if (days && days > 0) {
+                payout.durationDays = days
+              }
+              payout.durationResolved = true
+            }
+          } catch {
+            // Ignore transient error; will retry next time
+          }
+        } else if (!isMarketApp && senderKey && this.isValidContractAddress(senderKey)) {
+          if (senderDurationMap[senderKey]) {
+            payout.durationDays = senderDurationMap[senderKey]
+            payout.durationResolved = true
+          } else if (checkedTonnelDurationSenders.has(senderKey)) {
+            payout.durationResolved = true
+          } else {
+            try {
+              const getParams = await this.client.runGetMethod(senderKey, 'get_params')
+              if (getParams !== null) {
+                checkedTonnelDurationSenders.add(senderKey)
+                payout.durationResolved = true
+                if (getParams.success && getParams.stack && getParams.stack.length >= 4 && getParams.stack[3]?.num) {
+                  const durSec = BocParser.parseHexNumber(getParams.stack[3].num)
+                  if (durSec > 0) {
+                    const days = Math.max(1, Math.round(durSec / 86400))
+                    senderDurationMap[senderKey] = days
+                    payout.durationDays = days
+                  }
+                }
+              }
+            } catch {
+              // Ignore transient error; will retry next time
+            }
+          }
         }
       }
     }

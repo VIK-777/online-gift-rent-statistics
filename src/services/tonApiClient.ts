@@ -61,6 +61,18 @@ export interface TonGetMethodResult {
   stack?: Array<{ type: string; num?: string; cell?: string }>
 }
 
+export interface TonTraceNode {
+  transaction?: {
+    account?: { address?: string }
+    in_msg?: {
+      op_code?: string
+      raw_body?: string
+      source?: { address?: string; is_wallet?: boolean }
+    }
+  }
+  children?: TonTraceNode[]
+}
+
 export class TonApiClient {
   private baseUrl = 'https://tonapi.io/v2'
   private apiKey: string = ''
@@ -221,6 +233,13 @@ export class TonApiClient {
    */
   async getEvent(eventId: string): Promise<TonAccountEvent | null> {
     return this.request<TonAccountEvent>(`/events/${encodeURIComponent(eventId)}`)
+  }
+
+  /**
+   * Fetches full transaction trace tree by trace/event ID.
+   */
+  async getTrace(traceId: string): Promise<TonTraceNode | null> {
+    return this.request<TonTraceNode>(`/traces/${encodeURIComponent(traceId)}`)
   }
 
   /**

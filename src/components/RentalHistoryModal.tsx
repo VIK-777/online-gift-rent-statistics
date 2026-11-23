@@ -65,6 +65,11 @@ export const RentalHistoryModal: React.FC<RentalHistoryModalProps> = ({
                       <span className="text-sm font-bold text-emerald-400">
                         +{p.amountTon} TON
                       </span>
+                      {(p.durationDays ?? 0) > 0 && (
+                        <span className="px-1.5 py-0.5 rounded bg-slate-800 text-sky-400 font-mono text-[10px]">
+                          {p.durationDays}д
+                        </span>
+                      )}
                       {p.giftName && (
                         <span className="text-[11px] font-medium text-slate-300 truncate">
                           &bull; {p.giftName}
